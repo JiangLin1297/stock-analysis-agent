@@ -34,6 +34,6 @@ if exist "%~dp0dist\StockMind.exe" (
     start "" "%~dp0dist\StockAgent.exe"
 ) else (
     echo  未找到打包的 exe，使用 Python 启动...
-    python "%~dp0desktop_app.py"
+    python "%~dp0ui\app.py"
 )
 exit 0

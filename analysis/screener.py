@@ -612,8 +612,8 @@ def _parse_deepseek_json(raw: str) -> dict:
 
 def _deepseek_enhance_screening(stocks: list) -> list:
     """对筛选结果调用 DeepSeek 进行 LLM 增强分析。"""
-    from agent_prompts import SCREENER_ENHANCE_PROMPT
-    from deepseek_client import deepseek_chat
+    from agents.prompts import SCREENER_ENHANCE_PROMPT
+    from data.deepseek import deepseek_chat
 
     def _analyze_one(stock: dict) -> dict:
         sym = stock.get("symbol", "")
@@ -841,7 +841,7 @@ def validate_screening(days: int = 60, top_n: int = 5, scope: str = "hs300") -> 
     Returns:
         {"passed": bool, "avg_return_pct": float, "stocks": [...], "recommend_date": str}
     """
-    from data_pipeline import download_full_history, normalize_symbol
+    from data.pipeline import download_full_history, normalize_symbol
     import pandas as pd
 
     print(f"\n{'='*60}")

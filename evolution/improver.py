@@ -30,7 +30,7 @@ import random
 from datetime import datetime
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import certifi
     os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -331,7 +331,7 @@ def run_single_backtest(symbol: str, timeframe: str, days: int = None,
     Returns:
         {"symbol", "timeframe", "metrics": {...}, "trade_log": [...], "passed": bool, "details": {...}}
     """
-    from backtest_engine import run_backtest, random_period_test
+    from backtest.engine import run_backtest, random_period_test
 
     if days is None:
         days = TIMEFRAME_DAYS.get(timeframe, 180)
@@ -382,12 +382,12 @@ def run_single_backtest(symbol: str, timeframe: str, days: int = None,
 
 def run_deep_critique(bt_result: dict) -> dict:
     """对回测结果进行Critic深度分析。提供因子评分上下文。"""
-    from critic_agent import critic_evaluate
+    from agents.critic import critic_evaluate
 
     try:
         critic_result = critic_evaluate(bt_result["symbol"], use_mock=True)
 
-        from critic_agent import deep_dive_losing_trades
+        from agents.critic import deep_dive_losing_trades
         if bt_result.get("trade_log"):
             deep = deep_dive_losing_trades(
                 bt_result["trade_log"],
@@ -703,7 +703,7 @@ if __name__ == "__main__":
         )
     elif args.symbol:
         # Legacy single-stock mode
-        from critic_agent import critic_evaluate
+        from agents.critic import critic_evaluate
         # ... (kept for backward compatibility)
         print("Use --full for the new auto-evolution mode")
     else:

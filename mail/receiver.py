@@ -23,10 +23,10 @@ from email.header import decode_header
 from email.utils import parseaddr
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config_manager import get_config_value
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.config import get_config_value
 
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mail_command_log.txt")
+LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mail_command_log.txt")
 
 # ── 关键词路由表 ──
 # (关键词列表, 意图, 是否需要股票代码)
@@ -173,7 +173,7 @@ def _execute_analyze(symbol: str) -> str:
         return "[Error] 未识别到股票代码。请在邮件正文中包含6位股票代码，如 000001 或 600519。"
     _log(f"执行 analyze {symbol}")
     try:
-        from decision_engine import run_full_analysis
+        from agents.decision import run_full_analysis
         result = run_full_analysis(symbol, use_mock=True, use_adapted_params=True)
         lines = []
         decision = result.get("decision", {})
@@ -203,7 +203,7 @@ def _execute_analyze(symbol: str) -> str:
 def _execute_screen() -> str:
     _log("执行 screen")
     try:
-        from stock_screener import screen_stocks
+        from analysis.screener import screen_stocks
         stocks = screen_stocks(scope="hs300", top_n=10, use_mock=True)
         if not stocks:
             return "[Info] 当前未筛选出符合条件的股票"
@@ -224,7 +224,7 @@ def _execute_backtest(symbol: str, timeframe: str = "mid", days: int = 180) -> s
         return "[Error] 未识别到股票代码。请在邮件正文中包含6位股票代码。"
     _log(f"执行 backtest {symbol} {timeframe} {days}")
     try:
-        from backtest_runner import run_backtest_with_critic
+        from backtest.runner import run_backtest_with_critic
         result = run_backtest_with_critic(
             symbol=symbol, time_frame=timeframe, days=days,
             max_rounds=1, use_mock=True
@@ -246,7 +246,7 @@ def _execute_backtest(symbol: str, timeframe: str = "mid", days: int = 180) -> s
 def _execute_portfolio() -> str:
     _log("执行 portfolio")
     try:
-        from portfolio_manager import update_market_values, get_portfolio_summary
+        from portfolio.manager import update_market_values, get_portfolio_summary
         update_market_values()
         ps = get_portfolio_summary()
         lines = [
@@ -275,7 +275,7 @@ def _execute_status() -> str:
     _log("执行 status")
     lines = [f"StockMind 运行状态 @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
     try:
-        from portfolio_manager import get_portfolio_summary
+        from portfolio.manager import get_portfolio_summary
         ps = get_portfolio_summary()
         lines.append(f"总资产: {ps.get('total_assets',0):,.0f} | "
                    f"现金: {ps.get('cash',0):,.0f} | "
@@ -403,7 +403,7 @@ def check_and_execute() -> dict:
                 result["processed"] += 1
 
                 # 发送结果回复
-                from email_sender import send_email
+                from mail.sender import send_email
                 title = f"{intent} {symbol} | {today}"
                 html = _build_html(output, title)
                 send_email(f"Re: {subject}", html)

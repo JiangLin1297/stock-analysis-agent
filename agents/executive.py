@@ -8,8 +8,8 @@ import json
 import re
 import sys
 
-from agent_prompts import EXECUTIVE_AGENT_PROMPT
-from deepseek_client import deepseek_chat
+from agents.prompts import EXECUTIVE_AGENT_PROMPT
+from data.deepseek import deepseek_chat
 
 
 def _parse_json(raw: str) -> dict:
@@ -53,8 +53,8 @@ def executive_decision(symbol: str, market: str = "A", use_mock: bool = False) -
             "analysis_result": dict,
         }
     """
-    from portfolio_manager import load_portfolio, get_portfolio_summary
-    from decision_engine import run_full_analysis
+    from portfolio.manager import load_portfolio, get_portfolio_summary
+    from agents.decision import run_full_analysis
 
     # 1. 加载持仓
     pf = load_portfolio()
@@ -202,7 +202,7 @@ def _check_macro_risk() -> dict:
         "indices_checked": [],
     }
     try:
-        from data_pipeline import fetch_kline_indicators, normalize_symbol
+        from data.pipeline import fetch_kline_indicators, normalize_symbol
         for idx_code, idx_name in [("000001", "上证综指"), ("000300", "沪深300")]:
             sym, ex = normalize_symbol(idx_code)
             tech = fetch_kline_indicators(sym, ex, ndays=120)

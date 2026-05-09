@@ -17,7 +17,7 @@ def _data_dir() -> str:
     打包后用 exe 所在目录，开发模式用项目根目录。"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 PORTFOLIO_FILE = os.path.join(_data_dir(), "portfolio.json")
@@ -240,7 +240,7 @@ def update_market_values(pf: dict = None) -> dict:
         save_portfolio(pf)
         return pf
 
-    from data_pipeline import get_compressed_data
+    from data.pipeline import get_compressed_data
 
     updated_positions = []
     total_market_value = 0.0
@@ -256,7 +256,7 @@ def update_market_values(pf: dict = None) -> dict:
             # 如 compressed_data 拿不到收盘价，直接调用 K-line 接口
             if price is None:
                 try:
-                    from data_pipeline import fetch_kline_indicators, normalize_symbol
+                    from data.pipeline import fetch_kline_indicators, normalize_symbol
                     _sym, _ex = normalize_symbol(sym)
                     tech = fetch_kline_indicators(_sym, _ex, ndays=10)
                     price = tech.get("close")

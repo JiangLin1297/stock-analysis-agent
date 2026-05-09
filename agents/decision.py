@@ -11,9 +11,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
-from agent_prompts import ALL_PROMPTS
-from deepseek_client import deepseek_chat
-from format_utils import (card_header, card_line, card_empty, card_bottom, card_field,
+from agents.prompts import ALL_PROMPTS
+from data.deepseek import deepseek_chat
+from utils.format import (card_header, card_line, card_empty, card_bottom, card_field,
                           card_dual, section_div, format_signal, format_price, format_pct,
                           CARD_W, HALF_W)
 
@@ -525,10 +525,10 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         historical_date: 可选，历史日期字符串'2024-06-15'。传入后使用历史快照模式
         use_adapted_params: True=自动加载 {symbol}_adapted_params.json 并注入仓位/风控/信号阈值
     """
-    from data_pipeline import get_compressed_data, get_historical_snapshot
-    from agent_runner import run_all_agents
-    from time_frame_runner import run_time_frame_agents
-    from debate_engine import run_debate
+    from data.pipeline import get_compressed_data, get_historical_snapshot
+    from agents.runner import run_all_agents
+    from agents.time_frame import run_time_frame_agents
+    from agents.debate import run_debate
 
     # 自适应参数加载
     adapted_params = None
@@ -580,7 +580,7 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
     exit_advices = []
 
     if use_portfolio:
-        from portfolio_manager import load_portfolio, get_portfolio_summary
+        from portfolio.manager import load_portfolio, get_portfolio_summary
         pf = load_portfolio()
         # 获取持仓股票的当前价格用于汇总
         held_prices = {}
@@ -664,8 +664,8 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
 
     # 5. 单票持仓退出建议 + 动态持仓管理
     if position and isinstance(position, dict):
-        from exit_strategy import assess_exit
-        from holding_evaluator import evaluate_holding
+        from analysis.exit_strategy import assess_exit
+        from analysis.holding import evaluate_holding
         entry_price = float(position.get("entry_price", 0))
         quantity = int(position.get("quantity", 0))
         _quote = data.get("quote", {})
@@ -713,8 +713,8 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
 
     # 6. Portfolio 模式下对所有持仓生成退出建议
     if use_portfolio and portfolio_summary:
-        from exit_strategy import assess_exit
-        from portfolio_manager import load_portfolio
+        from analysis.exit_strategy import assess_exit
+        from portfolio.manager import load_portfolio
         pf = load_portfolio()
         _quote = data.get("quote", {})
         _tech = data.get("technical", {})
@@ -910,7 +910,7 @@ def generate_3d_factor_signals(symbol: str, compressed_data: dict = None,
         market_state["trend_state"] = compressed_data.get("trend_state", {}).get("trend_state", "SIDEWAYS")
         market_state["weekly_trend"] = compressed_data.get("weekly_trend", {})
 
-    from alpha_factors import calc_all_factors, composite_score
+    from analysis.alpha import calc_all_factors, composite_score
 
     # Detect stub financial data from historical mode and replace with None
     # so calc_all_factors will try to fetch real financial data
@@ -960,7 +960,7 @@ def run_factor_analysis(symbol: str, market: str = "A",
     Returns:
         {"symbol", "factors", "decision_3d", "llm_review": optional}
     """
-    from data_pipeline import get_compressed_data, get_historical_snapshot
+    from data.pipeline import get_compressed_data, get_historical_snapshot
 
     print(f"\n{'='*70}")
     print(f"  FACTOR ANALYSIS: {symbol}")
@@ -995,9 +995,9 @@ def run_factor_analysis(symbol: str, market: str = "A",
         if 50 <= score <= 65:
             try:
                 print(f"  [3/3] LLM复核(评分临界区间)...")
-                from agent_prompts import ALL_PROMPTS
-                from deepseek_client import deepseek_chat
-                from agent_runner import format_technical_context
+                from agents.prompts import ALL_PROMPTS
+                from data.deepseek import deepseek_chat
+                from agents.runner import format_technical_context
 
                 ctx = format_technical_context(data)
                 prompt_3d = ALL_PROMPTS.get("synthesis_3d_agent", "")
@@ -1035,7 +1035,7 @@ def batch_analyze_top_stocks(top_n: int = 5, use_portfolio: bool = False,
     先调用 screen_stocks 获取评分最高的 top_n 只股票，
     再对每一只运行 run_full_analysis，返回汇总列表。
     """
-    from stock_screener import screen_stocks
+    from analysis.screener import screen_stocks
 
     print(f"\n{'='*60}")
     print(f"  BATCH ANALYSIS — Top {top_n} stocks from {scope}")

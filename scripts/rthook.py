@@ -22,7 +22,7 @@ if getattr(sys, 'frozen', False):
     pass
 else:
     # 开发模式
-    project_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if project_dir not in sys.path:
         sys.path.insert(0, project_dir)
 
@@ -32,7 +32,7 @@ _log_dir = None
 if getattr(sys, 'frozen', False):
     _log_dir = os.path.dirname(sys.executable)
 else:
-    _log_dir = os.path.dirname(os.path.abspath(__file__))
+    _log_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 logging.basicConfig(
     filename=os.path.join(_log_dir, 'stock_mind.log'),

@@ -8,7 +8,7 @@ import io
 import json
 import re
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import certifi
     os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -16,8 +16,8 @@ try:
 except Exception:
     pass
 
-from agent_prompts import ALL_PROMPTS
-from deepseek_client import deepseek_chat
+from agents.prompts import ALL_PROMPTS
+from data.deepseek import deepseek_chat
 
 
 def _parse_json(raw: str) -> dict:
@@ -74,7 +74,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
 
     # ═══ 1. 数据层检查 ═══
     print("── [1/5] 数据完整性检查 ──")
-    from data_pipeline import get_compressed_data
+    from data.pipeline import get_compressed_data
     data, data_log = _capture_run(get_compressed_data, symbol, market)
 
     quote = data.get("quote", {})
@@ -99,7 +99,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
 
     # ═══ 2. Agent 运行 ═══
     print("\n── [2/5] Agent 分析检查 ──")
-    from agent_runner import run_all_agents
+    from agents.runner import run_all_agents
     reports, agent_log = _capture_run(run_all_agents, data, use_mock=use_mock)
 
     if not reports or len(reports) < 4:
@@ -111,7 +111,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
 
     # ═══ 3. 三线时间分析 ═══
     print("\n── [3/5] 三线时间维度检查 ──")
-    from time_frame_runner import run_time_frame_agents
+    from agents.time_frame import run_time_frame_agents
     time_opinions, tf_log = _capture_run(run_time_frame_agents, data, reports, use_mock=use_mock)
 
     for tf in ["short_term", "mid_term", "long_term"]:
@@ -122,7 +122,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
 
     # ═══ 4. 辩论检查 ═══
     print("\n── [4/5] 多空辩论检查 ──")
-    from debate_engine import run_debate
+    from agents.debate import run_debate
     debate, debate_log = _capture_run(run_debate, reports, use_mock=use_mock,
                                       time_frame_opinions=time_opinions)
 
@@ -132,7 +132,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
 
     # ═══ 5. 最终决策 ═══
     print("\n── [5/5] 三维决策检查 ──")
-    from decision_engine import make_decision
+    from agents.decision import make_decision
     decision, decision_log = _capture_run(make_decision, data, reports, debate,
                                            use_mock=use_mock, time_frame_opinions=time_opinions)
 
@@ -828,7 +828,7 @@ def deep_critique(full_backtest_report: dict, use_mock: bool = False,
         }
     else:
         # 调用 DeepSeek API 进行深度诊断
-        from agent_prompts import ALL_PROMPTS
+        from agents.prompts import ALL_PROMPTS
         prompt = ALL_PROMPTS.get("deep_critique", ALL_PROMPTS.get("critic_agent", ""))
         try:
             raw = deepseek_chat(prompt, f"请对这份回测报告进行深度诊断:\n\n{context}\n\n请输出JSON诊断结果。")

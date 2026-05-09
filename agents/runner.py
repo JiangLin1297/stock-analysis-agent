@@ -11,9 +11,9 @@ import json
 import re
 from datetime import datetime
 
-from agent_prompts import AGENT_PROMPTS
-from deepseek_client import deepseek_chat
-from format_utils import (card_header, card_line, card_empty, card_bottom, card_field,
+from agents.prompts import AGENT_PROMPTS
+from data.deepseek import deepseek_chat
+from utils.format import (card_header, card_line, card_empty, card_bottom, card_field,
                           card_dual, section_div, thin_sep, table_header, table_row,
                           table_sep, format_signal, format_pct, format_price, CARD_W)
 
@@ -959,7 +959,7 @@ def extract_news_sentiment(compressed_data: dict, use_mock: bool = True) -> dict
     if use_mock:
         return _mock_news_sentiment(news)
 
-    from agent_prompts import NEWS_SENTIMENT_PROMPT
+    from agents.prompts import NEWS_SENTIMENT_PROMPT
     ctx = format_sentiment_context(compressed_data)
     try:
         raw = deepseek_chat(NEWS_SENTIMENT_PROMPT, ctx, max_tokens=512, timeout=30)
@@ -1028,7 +1028,7 @@ def extract_qualitative_factors(compressed_data: dict, use_mock: bool = True) ->
     if use_mock:
         return _mock_qualitative(compressed_data)
 
-    from agent_prompts import QUALITATIVE_PROMPT
+    from agents.prompts import QUALITATIVE_PROMPT
     ctx = format_fundamental_context(compressed_data)
     try:
         raw = deepseek_chat(QUALITATIVE_PROMPT, ctx, max_tokens=512, timeout=30)
@@ -1144,7 +1144,7 @@ if __name__ == '__main__':
     if not use_mock:
         # 快速检测 API 可用性
         try:
-            from deepseek_client import deepseek_chat
+            from data.deepseek import deepseek_chat
             deepseek_chat("", "ping", max_tokens=256, timeout=15)
             print("DeepSeek API: 已连接\n")
         except Exception as e:

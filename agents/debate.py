@@ -5,9 +5,9 @@
 
 import json
 import re
-from agent_prompts import DEBATE_PROMPTS
-from deepseek_client import deepseek_chat
-from format_utils import card_header, card_line, card_bottom, section_div, CARD_W
+from agents.prompts import DEBATE_PROMPTS
+from data.deepseek import deepseek_chat
+from utils.format import card_header, card_line, card_bottom, section_div, CARD_W
 
 
 def _reports_to_context(agent_reports: list[dict]) -> str:

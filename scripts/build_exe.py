@@ -17,8 +17,8 @@ import subprocess
 import struct
 import argparse
 
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-ICON_PATH = os.path.join(PROJECT_DIR, "stock.ico")
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ICON_PATH = os.path.join(PROJECT_DIR, "assets", "stock.ico")
 SPEC_FILE = os.path.join(PROJECT_DIR, "StockMind.spec")
 
 
@@ -113,11 +113,18 @@ def get_hidden_imports():
         'PySide6', 'PySide6.QtWidgets', 'PySide6.QtCore', 'PySide6.QtGui',
         'numpy', 'pandas', 'urllib3', 'certifi',
     ]
-    for fname in os.listdir(PROJECT_DIR):
-        if fname.endswith('.py') and fname != 'build_exe.py':
-            mod_name = fname[:-3]
-            if mod_name not in imports:
-                imports.append(mod_name)
+    import_paths = [
+        'agents', 'data', 'analysis', 'backtest', 'evolution',
+        'portfolio', 'mail', 'ui', 'utils',
+    ]
+    for pkg in import_paths:
+        pkg_dir = os.path.join(PROJECT_DIR, pkg)
+        if os.path.isdir(pkg_dir):
+            for fname in os.listdir(pkg_dir):
+                if fname.endswith('.py') and fname != '__init__.py':
+                    mod_name = f"{pkg}.{fname[:-3]}"
+                    if mod_name not in imports:
+                        imports.append(mod_name)
     return imports
 
 
@@ -136,7 +143,7 @@ def build():
         print(f"    -> {os.path.basename(src)}")
 
     print("\n  [3/4] Running PyInstaller...")
-    entry_script = os.path.join(PROJECT_DIR, "desktop_app.py")
+    entry_script = os.path.join(PROJECT_DIR, "ui", "app.py")
 
     cmd = [
         sys.executable, '-m', 'PyInstaller',

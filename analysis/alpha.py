@@ -20,7 +20,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 FACTOR_WEIGHTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factor_weights.json")
 
@@ -385,7 +385,7 @@ FACTOR_REGISTRY = {
 
 def _load_history_df(symbol: str) -> pd.DataFrame:
     """加载历史日线 DataFrame。"""
-    from data_pipeline import download_full_history
+    from data.pipeline import download_full_history
     cache_path = download_full_history(symbol, ndays=800)
     df = pd.read_csv(cache_path)
     df['date'] = pd.to_datetime(df['date'])
@@ -409,7 +409,7 @@ def calc_all_factors(symbol: str, market: str = "A",
     Returns:
         {"factor_name": raw_value, ..., "_meta": {...}}
     """
-    from data_pipeline import normalize_symbol
+    from data.pipeline import normalize_symbol
 
     sym, exchange = normalize_symbol(symbol)
 
@@ -422,7 +422,7 @@ def calc_all_factors(symbol: str, market: str = "A",
     # 若未提供，获取实时数据
     if quote is None or technical is None:
         try:
-            from data_pipeline import fetch_spot, fetch_kline_indicators
+            from data.pipeline import fetch_spot, fetch_kline_indicators
             if quote is None:
                 quote = fetch_spot(sym, exchange)
             if technical is None:
@@ -433,7 +433,7 @@ def calc_all_factors(symbol: str, market: str = "A",
 
     if financials is None:
         try:
-            from data_pipeline import fetch_financial
+            from data.pipeline import fetch_financial
             financials = fetch_financial(sym)
         except Exception:
             financials = {}
@@ -557,7 +557,7 @@ def rank_stocks(universe: list = None, top_n: int = 50,
     """
     if universe is None:
         try:
-            from stock_screener import _get_constituents
+            from analysis.screener import _get_constituents
             universe = _get_constituents("hs300")
         except Exception:
             # Fallback to a small default set
@@ -568,7 +568,7 @@ def rank_stocks(universe: list = None, top_n: int = 50,
 
     # Phase 1: 快速行情过滤（减少财务数据获取量）
     try:
-        from stock_screener import _get_spot_batch
+        from analysis.screener import _get_spot_batch
         spots = _get_spot_batch(universe[:200])  # Limit initial batch
     except Exception:
         spots = {}
@@ -677,7 +677,7 @@ if __name__ == "__main__":
     if args.rank:
         pool = None
         if args.rank.lower() in ("hs300", "zz500"):
-            from stock_screener import _get_constituents
+            from analysis.screener import _get_constituents
             pool = _get_constituents(args.rank.lower())
         ranked = rank_stocks(pool, top_n=args.top, time_frame=args.timeframe)
         if args.json:

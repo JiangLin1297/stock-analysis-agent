@@ -2,11 +2,11 @@
 """Integration test: backtest + Critic + improvement loop."""
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
-from backtest_runner import run_backtest_with_critic
+from backtest.runner import run_backtest_with_critic
 
 result = run_backtest_with_critic(
     symbol="600744",

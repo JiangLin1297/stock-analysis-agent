@@ -20,9 +20,9 @@ from datetime import datetime, date
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data_pipeline import download_full_history, normalize_symbol
+from data.pipeline import download_full_history, normalize_symbol
 
 # ═══════════════════════════════════════════════════════════════
 # 1. 特征提取
@@ -318,7 +318,7 @@ def generate_adapted_dna(symbol: str, base_params_path: str = "600744_best_param
         result = _mock_adapt_dna(symbol, target_features, base_params)
     else:
         # ── LLM 深度适配 ──
-        from deepseek_client import deepseek_chat
+        from data.deepseek import deepseek_chat
         prompt = ADAPTATION_PROMPT.format(
             base_features=base_features_str,
             base_params=json.dumps(base_params, ensure_ascii=False, indent=2),
@@ -570,7 +570,7 @@ def auto_adapt_and_backtest(symbol: str, time_frame: str = "mid",
                                 use_mock=use_mock)
 
     # 2. 运行回测
-    from backtest_runner import run_backtest_with_critic
+    from backtest.runner import run_backtest_with_critic
 
     print(f"\n  [回测] 启动 {symbol} {time_frame}维度 {days}天回测...")
     result = run_backtest_with_critic(
@@ -590,14 +590,14 @@ def auto_adapt_and_backtest(symbol: str, time_frame: str = "mid",
     if (sharpe < 0.5 or total_return < 0) and max_rounds > 0:
         print(f"\n  [⚠] 回测不达标(夏普{sharpe:.2f}, 收益{total_return:+.2f}%)，启动深度诊断迭代...")
 
-        from critic_agent import deep_critique
+        from agents.critic import deep_critique
         diag = deep_critique(result, use_mock=use_mock, save_report=True)
 
         # 尝试应用诊断建议（最多3轮额外迭代）
         extra_rounds = min(3, max_rounds)
         if extra_rounds > 0:
             print(f"\n  [迭代] 基于诊断结果追加 {extra_rounds} 轮改进...")
-            from auto_improver import apply_fix
+            from evolution.improver import apply_fix
             project_dir = os.path.dirname(os.path.abspath(__file__))
             plan = diag.get("improvement_plan", {})
             short_fixes = plan.get("short_term", [])
@@ -608,7 +608,7 @@ def auto_adapt_and_backtest(symbol: str, time_frame: str = "mid",
                     pass
 
             # 重新回测
-            from backtest_runner import run_backtest_with_critic as _rerun
+            from backtest.runner import run_backtest_with_critic as _rerun
             result = _rerun(
                 symbol=symbol, time_frame=time_frame, days=days,
                 max_rounds=extra_rounds, initial_capital=initial_capital,

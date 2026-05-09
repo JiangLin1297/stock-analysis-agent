@@ -4,8 +4,8 @@
 """
 import json
 import re
-from agent_prompts import TIME_FRAME_PROMPTS
-from deepseek_client import deepseek_chat
+from agents.prompts import TIME_FRAME_PROMPTS
+from data.deepseek import deepseek_chat
 
 
 def _parse_json(raw: str) -> dict:

@@ -6,7 +6,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
-from config_manager import get_config_value
+from utils.config import get_config_value
 
 # Windows GBK console workaround
 if hasattr(sys.stdout, 'reconfigure'):
@@ -74,7 +74,7 @@ def send_daily_report() -> bool:
     # ── 持仓汇总 ──
     portfolio_html = "<p>暂无持仓数据</p>"
     try:
-        from portfolio_manager import get_portfolio_summary
+        from portfolio.manager import get_portfolio_summary
         ps = get_portfolio_summary()
         pnl = ps.get("total_floating_pnl", 0)
         pnl_pct = ps.get("total_pnl_pct", 0)
@@ -131,7 +131,7 @@ def send_daily_report() -> bool:
     # ── 智能选股 ──
     screening_html = "<p>暂无选股数据</p>"
     try:
-        from stock_screener import screen_stocks
+        from analysis.screener import screen_stocks
         stocks = screen_stocks(scope="hs300", top_n=5, use_mock=False)
         if stocks:
             rows = ""

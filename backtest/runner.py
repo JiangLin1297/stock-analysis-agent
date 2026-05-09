@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import certifi
     os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -23,9 +23,9 @@ try:
 except Exception:
     pass
 
-from backtest_engine import random_period_test, run_backtest, format_results
-from critic_agent import critique_backtest
-from auto_improver import apply_fix, backup_file
+from backtest.engine import random_period_test, run_backtest, format_results
+from agents.critic import critique_backtest
+from evolution.improver import apply_fix, backup_file
 
 EVOLUTION_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_evolution_log.txt")
 
@@ -104,8 +104,8 @@ def run_backtest_with_critic(symbol: str = "600744", time_frame: str = "mid",
                     pass
 
         # 重新导入（从重载后的模块获取最新版本）
-        from backtest_engine import run_backtest as _run_backtest
-        from critic_agent import critique_backtest as _critique_backtest
+        from backtest.engine import run_backtest as _run_backtest
+        from agents.critic import critique_backtest as _critique_backtest
 
         # ═══ 步骤1: 回测 ═══
         log(f"--- 第{round_num}轮: 回测 ---")
@@ -147,7 +147,7 @@ def run_backtest_with_critic(symbol: str = "600744", time_frame: str = "mid",
         if time_frame in ("mid", "long") and round_num >= 1:
             print(f"  [2b/3] 亏损交易深度剖析 ({time_frame}线)...")
             try:
-                from critic_agent import deep_dive_losing_trades
+                from agents.critic import deep_dive_losing_trades
                 tf_dive = "mid" if time_frame == "mid" else "long"
                 dive_result = deep_dive_losing_trades(
                     bt_result.get("trade_log", []), time_frame=tf_dive, use_mock=use_mock

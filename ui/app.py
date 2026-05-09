@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Optional
 
 # ── 确保项目路径 ──
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu
 
-from ui_theme import DARK, LIGHT, qss
+from ui.theme import DARK, LIGHT, qss
 
 # ═══════════════════════════════════════════════════════════════
 # 辅助：单实例保护
@@ -45,7 +45,7 @@ def _check_single_instance() -> bool:
     if getattr(sys, 'frozen', False):
         _LOCK_FILE = os.path.join(os.path.dirname(sys.executable), '.stockmind.lock')
     else:
-        _LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.stockmind.lock')
+        _LOCK_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.stockmind.lock')
     if os.path.exists(_LOCK_FILE):
         try:
             with open(_LOCK_FILE, 'r') as f:
@@ -108,7 +108,7 @@ class AnalysisWorker(QObject):
     # ── 深度分析 ──
     def run_deep_analysis(self, symbol: str, use_portfolio: bool = False,
                            use_adapted_params: bool = False):
-        from decision_engine import run_full_analysis
+        from agents.decision import run_full_analysis
         self._run_with_stdout(
             lambda: run_full_analysis(symbol, use_mock=False, use_portfolio=use_portfolio,
                                        use_adapted_params=use_adapted_params)
@@ -116,26 +116,26 @@ class AnalysisWorker(QObject):
 
     # ── 执行总裁分析 ──
     def run_executive(self, symbol: str):
-        from executive_agent import executive_decision
+        from agents.executive import executive_decision
         self._run_with_stdout(
             lambda: executive_decision(symbol, use_mock=False)
         )
 
     # ── 智能选股 ──
     def run_screening(self, scope: str, top_n: int):
-        from stock_screener import screen_stocks
+        from analysis.screener import screen_stocks
         self._run_with_stdout(
             lambda: screen_stocks(scope=scope, top_n=top_n, use_mock=False)
         )
 
     # ── 刷新持仓 ──
     def run_refresh_portfolio(self):
-        from portfolio_manager import update_market_values, get_portfolio_summary
+        from portfolio.manager import update_market_values, get_portfolio_summary
         self._run_with_stdout(lambda: (update_market_values(), get_portfolio_summary()))
 
     # ── 回测进化 ──
     def run_backtest(self, symbol: str, time_frame: str, days: int, max_rounds: int):
-        from backtest_runner import run_backtest_with_critic
+        from backtest.runner import run_backtest_with_critic
         self._run_with_stdout(
             lambda: run_backtest_with_critic(symbol=symbol, time_frame=time_frame,
                                               days=days, max_rounds=max_rounds, use_mock=True)
@@ -143,7 +143,7 @@ class AnalysisWorker(QObject):
 
     # ── 自适应迁移 ──
     def run_adaptation(self, symbol: str):
-        from stock_adapter import auto_adapt_and_backtest
+        from data.adapter import auto_adapt_and_backtest
         self._run_with_stdout(
             lambda: auto_adapt_and_backtest(symbol=symbol, time_frame="mid", days=180,
                                              max_rounds=3, use_mock=True)
@@ -365,7 +365,7 @@ class OverviewPage(QFrame):
 
     def refresh(self):
         """从 portfolio_manager 加载持仓并更新 UI。"""
-        from portfolio_manager import get_portfolio_summary, update_market_values
+        from portfolio.manager import get_portfolio_summary, update_market_values
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("⏳ 刷新中...")
 
@@ -544,14 +544,14 @@ class OverviewPage(QFrame):
 
     def _load_editor_data(self):
         """从 portfolio.json 加载当前数据到编辑面板。"""
-        from portfolio_manager import load_portfolio
+        from portfolio.manager import load_portfolio
         pf = load_portfolio(refresh=False)
         self.cash_input.setText(str(pf.get("cash", 0)))
         self.assets_input.setText(str(pf.get("total_assets", 0)))
 
     def _save_cash_assets(self):
         try:
-            from portfolio_manager import load_portfolio, save_portfolio
+            from portfolio.manager import load_portfolio, save_portfolio
             pf = load_portfolio(refresh=False)
             new_cash = float(self.cash_input.text().strip())
             new_assets = float(self.assets_input.text().strip()) if self.assets_input.text().strip() else None
@@ -580,7 +580,7 @@ class OverviewPage(QFrame):
             QMessageBox.warning(self, "错误", "成本价和数量必须为数字")
             return
 
-        from portfolio_manager import add_position
+        from portfolio.manager import add_position
         try:
             add_position(sym, price, qty, name=name)
             QMessageBox.information(self, "成功", f"已添加 {sym} {name} ×{qty} @ ¥{price:.2f}")
@@ -600,7 +600,7 @@ class OverviewPage(QFrame):
             QMessageBox.warning(self, "提示", "请输入要删除的股票代码")
             return
 
-        from portfolio_manager import load_portfolio, save_portfolio
+        from portfolio.manager import load_portfolio, save_portfolio
         pf = load_portfolio(refresh=False)
         target = None
         for pos in pf["positions"]:
@@ -1487,7 +1487,7 @@ class SettingsPage(QFrame):
         self._dark_mode = True
         self._scheduler_running = False
 
-        from config_manager import load_config, set_config_value, get_config_value
+        from utils.config import load_config, set_config_value, get_config_value
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -1669,7 +1669,7 @@ class SettingsPage(QFrame):
             toggle_btn.setText("👁")
 
     def _refresh_api_status(self):
-        from config_manager import get_config_value
+        from utils.config import get_config_value
         key = get_config_value("DEEPSEEK_API_KEY")
         if key:
             masked = key[:8] + "…" + key[-4:] if len(key) > 12 else "已设置"
@@ -1682,7 +1682,7 @@ class SettingsPage(QFrame):
         self.api_status.style().polish(self.api_status)
 
     def _save_api_key(self):
-        from config_manager import set_config_value
+        from utils.config import set_config_value
         key = self.api_key_input.text().strip()
         if key:
             set_config_value("DEEPSEEK_API_KEY", key)
@@ -1692,7 +1692,7 @@ class SettingsPage(QFrame):
             QMessageBox.warning(self, "提示", "请输入 API Key")
 
     def _refresh_mail_status(self):
-        from config_manager import get_config_value
+        from utils.config import get_config_value
         addr = get_config_value("EMAIL_ADDRESS")
         pwd = get_config_value("EMAIL_PASSWORD")
         if addr and pwd:
@@ -1708,7 +1708,7 @@ class SettingsPage(QFrame):
         self.mail_status.style().polish(self.mail_status)
 
     def _save_mail_config(self):
-        from config_manager import set_config_value
+        from utils.config import set_config_value
         addr = self.mail_addr_input.text().strip()
         pwd = self.mail_pwd_input.text().strip()
         recip = self.recip_input.text().strip()
@@ -1727,7 +1727,7 @@ class SettingsPage(QFrame):
     def _test_mail(self):
         self.mail_test_btn.setEnabled(False)
         self.mail_test_btn.setText("⏳ 发送中...")
-        from email_sender import send_test_email
+        from mail.sender import send_test_email
         ok = send_test_email()
         self.mail_test_btn.setEnabled(True)
         self.mail_test_btn.setText("📧 测试发送")
@@ -1740,7 +1740,7 @@ class SettingsPage(QFrame):
                                 "3. QQ邮箱是否已开启 SMTP 服务")
 
     def _toggle_mail_listener_local(self):
-        from config_manager import get_config_value
+        from utils.config import get_config_value
         addr = get_config_value("EMAIL_ADDRESS")
         pwd = get_config_value("EMAIL_PASSWORD")
         if not addr or not pwd:
@@ -1947,7 +1947,7 @@ class MainWindow(QMainWindow):
     # ── 邮件监听 ──
     def _auto_start_mail_listener(self):
         """自动启动邮件监听（如果已配置邮箱）。"""
-        from config_manager import get_config_value
+        from utils.config import get_config_value
         addr = get_config_value("EMAIL_ADDRESS")
         pwd = get_config_value("EMAIL_PASSWORD")
         if addr and pwd:
@@ -1957,7 +1957,7 @@ class MainWindow(QMainWindow):
     def _toggle_mail_listener(self, running: bool):
         self._mail_listener_running = running
         if running and self._mail_listener_thread is None:
-            from mail_receiver import start_mail_listener
+            from mail.receiver import start_mail_listener
             self._mail_listener_thread = threading.Thread(
                 target=start_mail_listener, args=(60,), daemon=True
             )
@@ -1970,7 +1970,7 @@ class MainWindow(QMainWindow):
 
     def _check_mail_now(self):
         """立即检查一次邮件指令（托盘菜单触发）。"""
-        from mail_receiver import check_and_execute
+        from mail.receiver import check_and_execute
         def _run():
             result = check_and_execute()
             n = result.get("processed", 0)
@@ -2092,13 +2092,13 @@ class SchedulerThread(QThread):
 
     def _run_task(self):
         try:
-            from portfolio_manager import update_market_values, get_portfolio_summary
+            from portfolio.manager import update_market_values, get_portfolio_summary
             update_market_values()
             ps = get_portfolio_summary()
             self.log_signal.emit(f"  总资产 ¥{ps['total_assets']:,.0f} 盈亏 {ps['total_floating_pnl']:+,.0f}")
 
             # 发送邮件报告
-            from email_sender import send_daily_report
+            from mail.sender import send_daily_report
             self.log_signal.emit("  正在发送邮件报告...")
             ok = send_daily_report()
             if ok:
@@ -2119,7 +2119,7 @@ def main():
         return
 
     # 加载 config.json 到环境变量
-    from config_manager import load_config
+    from utils.config import load_config
     cfg = load_config()
     for k, v in cfg.items():
         if v and not os.environ.get(k):

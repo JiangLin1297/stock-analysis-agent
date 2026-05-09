@@ -4,7 +4,7 @@ DeepSeek V4 API 客户端封装。
 支持本地部署、硅基流动(SiliconFlow)及其他 OpenAI 兼容 API。
 
 用法:
-    from deepseek_client import deepseek_chat
+    from data.deepseek import deepseek_chat
 
     reply = deepseek_chat("你是技术分析师", "分析贵州茅台的技术面")
     print(reply)

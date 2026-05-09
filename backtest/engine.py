@@ -19,7 +19,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ── 交易成本 ──
 COMMISSION_RATE = 0.0003      # 佣金 0.03%
@@ -67,7 +67,7 @@ def random_period_test(symbol: str, time_frame: str = "mid",
     Returns:
         {"symbol", "start_date", "end_date", "days", "time_frame", "seed"}
     """
-    from data_pipeline import download_full_history
+    from data.pipeline import download_full_history
 
     if seed is not None:
         random.seed(seed)
@@ -117,15 +117,15 @@ def run_backtest(symbol: str, start_date, end_date,
         {"symbol", "start_date", "end_date", "initial_capital", "final_equity",
          "trade_log": [...], "equity_curve": [...], "metrics": {...}}
     """
-    from data_pipeline import get_historical_snapshot, download_full_history
-    from decision_engine import generate_3d_factor_signals
-    from holding_evaluator import evaluate_holding
+    from data.pipeline import get_historical_snapshot, download_full_history
+    from agents.decision import generate_3d_factor_signals
+    from analysis.holding import evaluate_holding
 
     if not use_factor_model:
-        from decision_engine import make_decision
-        from agent_runner import run_all_agents
-        from time_frame_runner import run_time_frame_agents
-        from debate_engine import run_debate
+        from agents.decision import make_decision
+        from agents.runner import run_all_agents
+        from agents.time_frame import run_time_frame_agents
+        from agents.debate import run_debate
 
     # 确保数据已缓存
     download_full_history(symbol, ndays=800)

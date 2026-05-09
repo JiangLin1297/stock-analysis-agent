@@ -77,21 +77,21 @@ StockMind 是一个基于多 Agent 协作的智能股票分析系统。它模拟
 
 ## 核心模块
 
-| 模块 | 文件 | 职责 |
+| 模块 | 路径 | 职责 |
 |------|------|------|
-| 桌面客户端 | `desktop_app.py` | PySide6 桌面应用，系统托盘，实时流输出 |
-| 数据管道 | `data_pipeline.py` | 行情拉取、技术指标计算、财务数据获取 |
-| Agent 运行器 | `agent_runner.py` | 调度 4 个 LLM 分析 Agent 并行工作 |
-| Prompt 库 | `agent_prompts.py` | 所有 Agent 的系统提示词定义 |
-| 决策引擎 | `decision_engine.py` | 融合多维度分析，输出最终交易信号 |
-| 辩论引擎 | `debate_engine.py` | 多 Agent 交叉质证，消除群体盲点 |
-| Critic 诊断 | `critic_agent.py` | 深度回溯评估，生成改进路线图 |
-| 自进化引擎 | `auto_improver.py` | 策略基因提取、跨股迁移、参数自适应 |
-| 回测引擎 | `backtest_engine.py` | 全周期回测(短/中/长线)，夏普比率计算 |
-| 选股器 | `stock_screener.py` | 多因子量化选股，alpha 因子库 |
-| 持仓评估 | `holding_evaluator.py` | 实时持仓分析，退出策略判断 |
-| 邮件通道 | `mail_receiver.py` / `email_sender.py` | IMAP 指令接收 + SMTP 报告发送 |
-| 主题系统 | `ui_theme.py` | 深色/亮色双主题 QSS |
+| 桌面客户端 | `ui/app.py` | PySide6 桌面应用，系统托盘，实时流输出 |
+| 数据管道 | `data/pipeline.py` | 行情拉取、技术指标计算、财务数据获取 |
+| Agent 运行器 | `agents/runner.py` | 调度 4 个 LLM 分析 Agent 并行工作 |
+| Prompt 库 | `agents/prompts.py` | 所有 Agent 的系统提示词定义 |
+| 决策引擎 | `agents/decision.py` | 融合多维度分析，输出最终交易信号 |
+| 辩论引擎 | `agents/debate.py` | 多 Agent 交叉质证，消除群体盲点 |
+| Critic 诊断 | `agents/critic.py` | 深度回溯评估，生成改进路线图 |
+| 自进化引擎 | `evolution/improver.py` | 策略基因提取、跨股迁移、参数自适应 |
+| 回测引擎 | `backtest/engine.py` | 全周期回测(短/中/长线)，夏普比率计算 |
+| 选股器 | `analysis/screener.py` | 多因子量化选股，alpha 因子库 |
+| 持仓评估 | `analysis/holding.py` | 实时持仓分析，退出策略判断 |
+| 邮件通道 | `mail/receiver.py` / `mail/sender.py` | IMAP 指令接收 + SMTP 报告发送 |
+| 主题系统 | `ui/theme.py` | 深色/亮色双主题 QSS |
 
 ---
 
@@ -148,7 +148,7 @@ set DEEPSEEK_API_KEY=sk-xxxxxxxx
 
 ```bash
 # 直接运行桌面应用
-python desktop_app.py
+python ui/app.py
 
 # 或使用启动脚本
 run.bat
@@ -173,33 +173,64 @@ python mail_receiver.py --listen
 
 ```
 stock-analysis/
-├── desktop_app.py          # 桌面主程序 (PySide6)
-├── agent_runner.py         # Agent 调度器
-├── agent_prompts.py        # LLM Prompt 定义
-├── decision_engine.py      # 最终决策引擎
-├── debate_engine.py        # 多Agent辩论引擎
-├── critic_agent.py         # 深度诊断与评估
-├── auto_improver.py        # 自进化引擎
-├── backtest_engine.py      # 回测引擎
-├── backtest_runner.py      # 回测运行器
-├── stock_screener.py       # 量化选股器
-├── alpha_factors.py        # Alpha 因子库
-├── holding_evaluator.py    # 持仓评估
-├── data_pipeline.py        # 数据管道
-├── deepseek_client.py      # LLM API 客户端
-├── mail_receiver.py        # 邮件指令接收
-├── email_sender.py         # 邮件发送
-├── config_manager.py       # 配置管理
-├── portfolio_manager.py    # 组合管理
-├── exit_strategy.py        # 退出策略
-├── format_utils.py         # 终端格式化输出
-├── ui_theme.py             # UI 主题定义
-├── stock_adapter.py        # 股票数据适配器
-├── time_frame_runner.py    # 多周期运行器
-├── build_exe.py            # PyInstaller 打包脚本
-├── run.bat                 # Windows 启动脚本
-├── stock.ico / app_icon.ico # 应用图标
-└── test_backtest_integration.py  # 回测集成测试
+├── agents/                      # AI Agent 团队
+│   ├── prompts.py               # LLM Prompt 定义库
+│   ├── runner.py                # Agent 调度器
+│   ├── critic.py                # 深度诊断与评估
+│   ├── debate.py                # 多Agent辩论引擎
+│   ├── decision.py              # 最终决策引擎
+│   ├── executive.py             # 执行Agent
+│   └── time_frame.py            # 多周期运行器
+│
+├── data/                        # 数据层
+│   ├── pipeline.py              # 数据管道 (行情/技术指标/财务)
+│   ├── adapter.py               # 股票数据适配器
+│   └── deepseek.py              # DeepSeek API 客户端
+│
+├── analysis/                    # 分析模块
+│   ├── screener.py              # 量化选股器
+│   ├── alpha.py                 # Alpha 因子库
+│   ├── holding.py               # 持仓动态评估
+│   └── exit_strategy.py         # 退出策略
+│
+├── backtest/                    # 回测系统
+│   ├── engine.py                # 回测引擎核心
+│   └── runner.py                # 回测运行器
+│
+├── evolution/                   # 自进化系统
+│   └── improver.py              # 策略自动进化引擎
+│
+├── portfolio/                   # 组合管理
+│   └── manager.py               # 持仓与资产管理
+│
+├── mail/                        # 邮件通道
+│   ├── receiver.py              # IMAP 指令接收
+│   └── sender.py                # SMTP 邮件发送
+│
+├── ui/                          # 桌面客户端
+│   ├── app.py                   # 主程序 (PySide6)
+│   └── theme.py                 # 深色/亮色主题
+│
+├── utils/                       # 工具模块
+│   ├── config.py                # 配置管理
+│   └── format.py                # 终端格式化输出
+│
+├── scripts/                     # 打包与工具脚本
+│   ├── build_exe.py             # PyInstaller 打包
+│   └── rthook.py                # 运行时钩子
+│
+├── tests/                       # 测试
+│   └── test_backtest_integration.py
+│
+├── assets/                      # 静态资源
+│   ├── stock.ico
+│   └── app_icon.ico
+│
+├── run.bat                      # Windows 启动脚本
+├── requirements.txt
+├── README.md
+├── StockMind.spec               # PyInstaller 构建配置
+└── EVOLUTION_REPORT.md          # 进化报告
 ```
 
 ---
