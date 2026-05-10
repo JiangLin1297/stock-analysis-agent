@@ -106,6 +106,17 @@ def qss(theme: dict) -> str:
         background: {t['bg_hover']};
         color: {t['text_primary']};
     }}
+    QPushButton#tbClose {{
+        background: transparent;
+        border: none;
+        border-radius: 6px;
+        padding: 4px 10px;
+        font-size: 15px;
+        font-weight: 700;
+        color: {t['text_secondary']};
+        min-width: 32px;
+        min-height: 24px;
+    }}
     QPushButton#tbClose:hover {{
         background: {t['danger']};
         color: white;
@@ -392,17 +403,17 @@ def qss(theme: dict) -> str:
         background: {t['bg_card']};
         border: 1px solid {t['border']};
         border-radius: 12px;
-        margin-top: 16px;
-        padding: 20px 16px 16px;
+        margin-top: 10px;
+        padding: 28px 0px 0px 0px;
         font-weight: 600;
     }}
     QGroupBox::title {{
         subcontrol-origin: margin;
         left: 16px;
         padding: 0 8px;
-        color: {t['text_secondary']};
-        font-size: 12px;
-        font-weight: 500;
+        color: {t['accent']};
+        font-size: 13px;
+        font-weight: 600;
     }}
 
     /* ── Tooltip ── */

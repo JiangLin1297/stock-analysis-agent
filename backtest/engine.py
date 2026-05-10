@@ -127,11 +127,8 @@ def run_backtest(symbol: str, start_date, end_date,
         from agents.time_frame import run_time_frame_agents
         from agents.debate import run_debate
 
-    # 确保数据已缓存
-    download_full_history(symbol, ndays=800)
-    cache_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "history_cache", f"{symbol}.csv"
-    )
+    # 确保数据已缓存（download_full_history 返回正确的缓存路径）
+    cache_path = download_full_history(symbol, ndays=800)
     df_full = pd.read_csv(cache_path)
     df_full['date'] = pd.to_datetime(df_full['date']).dt.date
 

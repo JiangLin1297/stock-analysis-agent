@@ -7,6 +7,7 @@ import os
 import io
 import json
 import re
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
@@ -887,8 +888,11 @@ def deep_critique(full_backtest_report: dict, use_mock: bool = False,
 
     # ── 保存 strategy_diagnosis.md ──
     if save_report:
-        md_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "strategy_diagnosis.md")
+        def _critic_data_dir():
+            if getattr(sys, 'frozen', False):
+                return os.path.dirname(sys.executable)
+            return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        md_path = os.path.join(_critic_data_dir(), "strategy_diagnosis.md")
         _save_diagnosis_md(md_path, symbol, full_backtest_report, result)
         print(f"\n  📄 诊断报告已保存: {md_path}")
 

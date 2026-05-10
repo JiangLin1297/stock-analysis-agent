@@ -4,3 +4,4 @@ requests>=2.25.0
 stockstats>=0.5.3
 akshare>=1.12.0
 PySide6>=6.5.0
+pywin32>=305

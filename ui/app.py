@@ -10,6 +10,7 @@ import queue
 import re
 import threading
 import atexit
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -20,12 +21,13 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QStackedWidget,
     QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
-    QComboBox, QSpinBox, QCheckBox, QGroupBox, QProgressBar,
+    QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QGroupBox, QProgressBar,
+    QTabWidget, QTextEdit, QStatusBar,
     QMessageBox, QSlider, QAbstractItemView, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, QObject, Signal, Slot, QThread, QPropertyAnimation,
-    QEasingCurve, QTimer, QRect,
+    QEasingCurve, QTimer, QRect, QEvent,
 )
 from PySide6.QtGui import (
     QFont, QIcon, QAction, QColor, QPixmap, QPainter, QBrush,
@@ -73,25 +75,33 @@ def _check_single_instance() -> bool:
 # 工作线程 stdout 重定向
 # ═══════════════════════════════════════════════════════════════
 
+_stdout_lock = threading.Lock()
+
 class WorkerStdout:
-    """在 worker 线程中捕获 print()，通过回调发射到 GUI。"""
+    """在 worker 线程中捕获 print()，节流发射到 GUI 防止信号洪泛导致 UI 冻结。"""
     def __init__(self, callback):
         self.callback = callback
         self.buffer = ""
+        self._last_emit = 0.0
+        self._min_interval = 0.15  # 最少 150ms 间隔，防止 UI 被海量信号淹没
 
     def write(self, text):
         if not text:
             return
         self.buffer += text
-        if '\n' in text or len(self.buffer) >= 200:
-            if self.callback:
-                self.callback(self.buffer)
-            self.buffer = ""
+        now = time.time()
+        # 节流：超过 150ms 或累积超过 4000 字符才发射信号
+        if len(self.buffer) >= 4000 or (now - self._last_emit >= self._min_interval):
+            self._do_emit()
+            self._last_emit = now
 
     def flush(self):
-        if self.buffer and self.callback:
+        self._do_emit()
+
+    def _do_emit(self):
+        if self.buffer.strip() and self.callback:
             self.callback(self.buffer)
-            self.buffer = ""
+        self.buffer = ""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -169,26 +179,54 @@ class AnalysisWorker(QObject):
         return genes
 
     def _run_with_stdout(self, fn):
-        """通用：重定向 stdout → log_signal, 执行 fn, 发射 result。"""
+        """通用：重定向 stdout → log_signal, 执行 fn, 发射 result。
+        使用 finally 确保 sys.stdout 始终被恢复。"""
+        if not _stdout_lock.acquire(blocking=False):
+            # 已有其他 worker 在捕获 stdout，直接执行不捕获
+            try:
+                result = fn()
+                self.finished.emit(result)
+            except Exception as e:
+                self.error.emit(str(e))
+            return
+
         def _emit(text):
             self.log_signal.emit(text)
 
         old = sys.stdout
-        sys.stdout = WorkerStdout(_emit)
+        captured = WorkerStdout(_emit)
+        sys.stdout = captured
         try:
             self.progress_signal.emit(10, "加载中...")
             result = fn()
-            sys.stdout.flush()
-            sys.stdout = old
+            captured.flush()
             self.progress_signal.emit(100, "完成")
             self.finished.emit(result)
         except Exception as e:
-            sys.stdout.flush()
-            sys.stdout = old
+            captured.flush()
             import traceback
             self.log_signal.emit(f"\n❌ 错误: {e}\n{traceback.format_exc()}")
             self.progress_signal.emit(0, "失败")
             self.error.emit(str(e))
+        finally:
+            sys.stdout = old
+            _stdout_lock.release()
+
+
+class OverviewWorker(QObject):
+    """后台线程：更新持仓市值，返回摘要数据。"""
+    finished = Signal(object)  # portfolio_summary dict
+    error = Signal(str)
+
+    def run(self):
+        try:
+            from portfolio.manager import update_market_values, get_portfolio_summary
+            update_market_values()
+            ps = get_portfolio_summary()
+            self.finished.emit(ps)
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -227,12 +265,13 @@ class SectionTitle(QLabel):
 
 
 class ModernButton(QPushButton):
-    """带样式的按钮，自动设置 objectName。"""
+    """带样式的按钮，自动设置 objectName 和最小高度。"""
     def __init__(self, text: str, primary=False, success=False, danger=False, parent=None):
         super().__init__(text, parent)
         if primary: self.setObjectName("btnPrimary")
         elif success: self.setObjectName("btnSuccess")
         elif danger: self.setObjectName("btnDanger")
+        self.setMinimumHeight(36)
         self.setCursor(Qt.PointingHandCursor)
 
 
@@ -245,18 +284,19 @@ class TitleBar(QFrame):
         super().__init__(parent)
         self.setObjectName("titleBar")
         self.setFixedHeight(44)
-        self.parent = parent
         self._drag_pos = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 0, 8, 0)
         layout.setSpacing(4)
 
-        # 应用名
+        # 应用名 — 鼠标事件穿透，由 TitleBar 统一处理拖拽
         icon_lbl = QLabel("🧠")
         icon_lbl.setStyleSheet("font-size: 18px;")
+        icon_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.title_lbl = QLabel("StockMind")
         self.title_lbl.setObjectName("titleLabel")
+        self.title_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
         # 主题切换
         self.theme_btn = QPushButton("🌓")
@@ -265,12 +305,19 @@ class TitleBar(QFrame):
         self.theme_btn.setFixedSize(36, 28)
 
         # 窗口按钮
-        self.min_btn = QPushButton("─")
+        self.min_btn = QPushButton("🗕")
         self.min_btn.setObjectName("tbBtn")
+        self.min_btn.setToolTip("最小化")
         self.min_btn.setFixedSize(36, 28)
+
+        self.max_btn = QPushButton("🗖")
+        self.max_btn.setObjectName("tbBtn")
+        self.max_btn.setToolTip("最大化")
+        self.max_btn.setFixedSize(36, 28)
+
         self.close_btn = QPushButton("✕")
-        self.close_btn.setObjectName("tbBtn")
         self.close_btn.setObjectName("tbClose")
+        self.close_btn.setToolTip("关闭到系统托盘")
         self.close_btn.setFixedSize(36, 28)
 
         layout.addWidget(icon_lbl)
@@ -278,20 +325,45 @@ class TitleBar(QFrame):
         layout.addStretch()
         layout.addWidget(self.theme_btn)
         layout.addWidget(self.min_btn)
+        layout.addWidget(self.max_btn)
         layout.addWidget(self.close_btn)
 
-        self.min_btn.clicked.connect(lambda: parent.showMinimized() if parent else None)
-        self.close_btn.clicked.connect(lambda: parent.hide_to_tray() if parent and hasattr(parent, 'hide_to_tray') else None)
+        self.min_btn.clicked.connect(self._on_minimize)
+        self.max_btn.clicked.connect(self._toggle_maximize)
+        self.close_btn.clicked.connect(self._on_close)
+
+    def _on_minimize(self):
+        p = self.window()
+        if p:
+            p._minimize_window()
+
+    def _on_close(self):
+        p = self.window()
+        if p and hasattr(p, 'hide_to_tray'):
+            p.hide_to_tray()
+
+    def _toggle_maximize(self):
+        p = self.window()
+        if p.isMaximized():
+            p.showNormal()
+            self.max_btn.setText("🗖")
+        else:
+            p.showMaximized()
+            self.max_btn.setText("🗗")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.parent().frameGeometry().topLeft() if self.parent() else None
+            self._drag_pos = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self._drag_pos is not None and self.parent():
-            self.parent().move(event.globalPosition().toPoint() - self._drag_pos)
+        if event.buttons() == Qt.LeftButton and self._drag_pos is not None:
+            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
             event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._toggle_maximize()
 
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
@@ -308,6 +380,8 @@ class OverviewPage(QFrame):
         super().__init__(parent)
         self.setObjectName("page")
         self._editor_visible = False
+        self._worker = None
+        self._thread = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -335,6 +409,7 @@ class OverviewPage(QFrame):
         self.edit_toggle_btn.clicked.connect(self._toggle_editor)
         self.refresh_btn = ModernButton("🔄 刷新市值", primary=True)
         self.refresh_btn.setFixedWidth(130)
+        self.refresh_btn.clicked.connect(self.refresh)
         toolbar.addWidget(title)
         toolbar.addStretch()
         toolbar.addWidget(self.edit_toggle_btn)
@@ -364,70 +439,92 @@ class OverviewPage(QFrame):
         layout.addWidget(self.table, stretch=1)
 
     def refresh(self):
-        """从 portfolio_manager 加载持仓并更新 UI。"""
-        from portfolio.manager import get_portfolio_summary, update_market_values
+        """加载持仓并更新 UI。先显示缓存数据，再后台刷新实时价格。"""
+        # Step 1：立即显示缓存数据（不阻塞 UI）
+        try:
+            from portfolio.manager import get_portfolio_summary
+            ps = get_portfolio_summary()
+            self._update_ui(ps)
+        except Exception:
+            pass
+
+        # Step 2：后台线程刷新实时市值
+        self._start_bg_refresh()
+
+    def _start_bg_refresh(self):
+        """在后台线程更新市值，完成后通过信号更新 UI。"""
+        if self._thread is not None and self._thread.isRunning():
+            return  # 已有刷新在进行中
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("⏳ 刷新中...")
 
-        def _do():
-            try:
-                update_market_values()
-                ps = get_portfolio_summary()
+        self._thread = QThread()
+        self._worker = OverviewWorker()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_refresh_done)
+        self._worker.error.connect(self._on_refresh_error)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(lambda: setattr(self, '_thread', None))
+        self._thread.start()
 
-                # 指标卡片
-                total = ps['total_assets']
-                pnl = ps['total_floating_pnl']
-                pnl_pct = ps['total_pnl_pct']
-                cash = ps['cash']
-                pos_count = ps['position_count']
-                pnl_color = DARK['up'] if pnl >= 0 else DARK['down']
+    def _on_refresh_done(self, ps):
+        self.refresh_btn.setEnabled(True)
+        self.refresh_btn.setText("🔄 刷新市值")
+        if ps:
+            self._update_ui(ps)
 
-                self.total_card.set_value(f"¥{total:,.0f}")
-                self.pnl_card.set_value(f"¥{pnl:+,.0f} ({pnl_pct:+.1f}%)", pnl_color)
-                self.pos_card.set_value(f"{pos_count} 只")
-                self.cash_card.set_value(f"¥{cash:,.0f}")
+    def _on_refresh_error(self, msg):
+        self.refresh_btn.setEnabled(True)
+        self.refresh_btn.setText("🔄 刷新市值")
+        print(f"[Overview] 刷新失败: {msg}")
 
-                # 表格
-                self.table.setSortingEnabled(False)
-                self.table.setRowCount(0)
-                positions = ps.get("positions", [])
-                self.table.setRowCount(len(positions))
+    def _update_ui(self, ps):
+        """用持仓摘要数据更新卡片和表格。"""
+        total = ps['total_assets']
+        pnl = ps['total_floating_pnl']
+        pnl_pct = ps['total_pnl_pct']
+        cash = ps['cash']
+        pos_count = ps['position_count']
+        pnl_color = DARK['up'] if pnl >= 0 else DARK['down']
 
-                for i, p in enumerate(positions):
-                    items_data = [
-                        (p["symbol"], None),
-                        (p.get("name", ""), None),
-                        (f"{p['entry_price']:.2f}", None),
-                        (f"{p.get('current_price', 0):.2f}", None),
-                        (str(p["quantity"]), None),
-                        (f"¥{p['market_value']:,.0f}", None),
-                        (f"{p.get('floating_pnl_pct', 0):+.1f}%",
-                         DARK['up'] if p.get('floating_pnl_pct', 0) >= 0 else DARK['down']),
-                    ]
-                    for col, (text, color) in enumerate(items_data):
-                        item = QTableWidgetItem(text)
-                        item.setTextAlignment(Qt.AlignCenter)
-                        if color:
-                            item.setForeground(QColor(color))
-                        self.table.setItem(i, col, item)
+        self.total_card.set_value(f"¥{total:,.0f}")
+        self.pnl_card.set_value(f"¥{pnl:+,.0f} ({pnl_pct:+.1f}%)", pnl_color)
+        self.pos_card.set_value(f"{pos_count} 只")
+        self.cash_card.set_value(f"¥{cash:,.0f}")
 
-                    # 操作按钮
-                    btn = QPushButton("🔍 分析")
-                    btn.setObjectName("btnPrimary")
-                    btn.setStyleSheet("padding: 4px 12px; font-size: 11px;")
-                    sym = p["symbol"]
-                    btn.clicked.connect(lambda checked, s=sym: self.analyze_requested.emit(s))
-                    self.table.setCellWidget(i, 7, btn)
+        # 表格
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        positions = ps.get("positions", [])
+        self.table.setRowCount(len(positions))
 
-                self.table.setSortingEnabled(True)
-                self.refresh_btn.setEnabled(True)
-                self.refresh_btn.setText("🔄 刷新市值")
-            except Exception as e:
-                self.refresh_btn.setEnabled(True)
-                self.refresh_btn.setText("🔄 刷新市值")
-                print(f"⚠ 刷新失败: {e}")
+        for i, p in enumerate(positions):
+            items_data = [
+                (p["symbol"], None),
+                (p.get("name", ""), None),
+                (f"{p['entry_price']:.2f}", None),
+                (f"{p.get('current_price', 0):.2f}", None),
+                (str(p["quantity"]), None),
+                (f"¥{p['market_value']:,.0f}", None),
+                (f"{p.get('floating_pnl_pct', 0):+.1f}%",
+                 DARK['up'] if p.get('floating_pnl_pct', 0) >= 0 else DARK['down']),
+            ]
+            for col, (text, color) in enumerate(items_data):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                if color:
+                    item.setForeground(QColor(color))
+                self.table.setItem(i, col, item)
 
-        QTimer.singleShot(50, _do)
+            btn = QPushButton("🔍 分析")
+            btn.setObjectName("btnPrimary")
+            btn.setStyleSheet("padding: 4px 12px; font-size: 11px;")
+            sym = p["symbol"]
+            btn.clicked.connect(lambda checked, s=sym: self.analyze_requested.emit(s))
+            self.table.setCellWidget(i, 7, btn)
+
+        self.table.setSortingEnabled(True)
 
     # ── 手动编辑持仓 ──
     def _create_editor_panel(self):
@@ -651,6 +748,7 @@ class AnalysisPage(QFrame):
         self.setObjectName("page")
         self._worker = None
         self._thread = None
+        self._running = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -681,6 +779,12 @@ class AnalysisPage(QFrame):
         input_row.addWidget(self.portfolio_cb)
         input_row.addWidget(self.adaptive_cb)
         input_row.addStretch()
+        self.copy_btn = ModernButton("📋 复制报告")
+        self.copy_btn.setFixedHeight(36)
+        self.copy_btn.setToolTip("复制分析输出内容到剪贴板")
+        self.copy_btn.clicked.connect(self._copy_output)
+        self.copy_btn.setEnabled(False)
+        input_row.addWidget(self.copy_btn)
         layout.addLayout(input_row)
 
         # ── 进度条 ──
@@ -691,67 +795,29 @@ class AnalysisPage(QFrame):
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
 
-        # ── 输出区域 ──
-        self.output = QFrame()
-        self.output.setObjectName("card")
-        out_layout = QVBoxLayout(self.output)
-        out_layout.setContentsMargins(0, 0, 0, 0)
-        self.output_text = QLabel("输入股票代码，点击「开始深度分析」查看完整分析过程。\n"
-                                   "所有 Agent 思考、多空辩论和最终决策将实时输出。")
-        self.output_text.setWordWrap(True)
-        self.output_text.setStyleSheet("padding: 16px; color: #7982a9; font-size: 12px;")
-        out_layout.addWidget(self.output_text)
-        layout.addWidget(self.output, stretch=1)
+        # ── 输出区域：使用 QTextEdit 替代逐行 QLabel，防止海量 widget 导致闪退 ──
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setPlaceholderText(
+            "输入股票代码，点击「开始深度分析」查看完整分析过程。\n"
+            "所有 Agent 思考、多空辩论和最终决策将实时输出。")
+        self.output_text.setStyleSheet(
+            "QTextEdit { background: transparent; color: #c0caf5; font-family: 'Consolas', monospace; "
+            "font-size: 12px; border: none; padding: 16px; }")
+        layout.addWidget(self.output_text, stretch=1)
 
         # ── 快捷键 ──
         self.symbol_input.returnPressed.connect(self.start_analysis)
 
     def _clear_output(self):
-        """清除输出区，重置为滚动容器。"""
-        out_layout = self.output.layout()
-        # 移除旧 widget
-        for i in range(out_layout.count()):
-            w = out_layout.itemAt(i).widget()
-            if w:
-                w.setParent(None)
-                w.deleteLater()
-
-        from PySide6.QtWidgets import QScrollArea
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("background: transparent;")
-
-        scroll_content = QWidget()
-        scroll_content.setStyleSheet("background: transparent;")
-        self._scroll_layout = QVBoxLayout(scroll_content)
-        self._scroll_layout.setContentsMargins(16, 16, 16, 16)
-        self._scroll_layout.setSpacing(4)
-        self._scroll_layout.addStretch()
-        scroll.setWidget(scroll_content)
-
-        out_layout.addWidget(scroll)
+        self.copy_btn.setEnabled(False)
+        self._running = True
+        self.output_text.clear()
 
     def _append_output(self, text: str):
-        """向输出区追加文本（从 worker 线程接收）。"""
-        if not hasattr(self, '_scroll_layout') or self._scroll_layout is None:
+        if not self._running:
             return
-        # 移除最后的 stretch
-        if self._scroll_layout.count() > 0:
-            last = self._scroll_layout.itemAt(self._scroll_layout.count() - 1)
-            if last and last.spacerItem():
-                self._scroll_layout.removeItem(last)
-
-        from PySide6.QtWidgets import QLabel
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setStyleSheet("color: #c0caf5; font-family: 'Consolas', monospace; "
-                            "font-size: 12px; line-height: 1.4; background: transparent;")
-        label.setTextFormat(Qt.PlainText)
-        self._scroll_layout.addWidget(label)
-
-        # 重新添加 stretch
-        self._scroll_layout.addStretch()
+        self.output_text.append(text.rstrip('\n'))
 
     def set_loading(self, loading: bool):
         self.analyze_btn.setEnabled(not loading)
@@ -760,7 +826,7 @@ class AnalysisPage(QFrame):
         self.progress.setVisible(loading)
         if loading:
             self.progress.setValue(0)
-            self.progress.setRange(0, 0)  # indeterminate
+            self.progress.setRange(0, 0)
         else:
             self.progress.setRange(0, 100)
             self.progress.setValue(100)
@@ -798,21 +864,35 @@ class AnalysisPage(QFrame):
             self._thread.started.connect(lambda: self._worker.run_executive(symbol))
 
         self._worker.log_signal.connect(self._append_output)
-        self._worker.progress_signal.connect(lambda p, s: None)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.error.connect(self._on_worker_error)
         self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.finished.connect(lambda: setattr(self, '_thread', None))
-
         self._thread.start()
 
     def _on_worker_finished(self, result):
         self.set_loading(False)
         self._append_output("\n✅ 分析完成！\n")
+        self.copy_btn.setEnabled(True)
+        self._running = False
 
     def _on_worker_error(self, msg):
         self.set_loading(False)
         self._append_output(f"\n❌ 分析失败: {msg}\n")
+        self.copy_btn.setEnabled(True)
+        self._running = False
+
+    def _copy_output(self):
+        text = self.output_text.toPlainText()
+        if text.strip():
+            QApplication.clipboard().setText(text)
+            self.copy_btn.setText("✅ 已复制")
+            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
+        else:
+            self.copy_btn.setText("⚠ 无内容")
+            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
+        w = self.window()
+        if w and hasattr(w, 'copy_to_clipboard'):
+            w.copy_to_clipboard(text)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -852,6 +932,12 @@ class ScreeningPage(QFrame):
         self.screen_btn = ModernButton("🎯 开始智能选股", primary=True)
         self.screen_btn.setFixedHeight(36)
         controls.addWidget(self.screen_btn)
+        self.screen_copy_btn = ModernButton("📋 复制报告")
+        self.screen_copy_btn.setFixedHeight(36)
+        self.screen_copy_btn.setToolTip("复制选股结果到剪贴板")
+        self.screen_copy_btn.clicked.connect(self._copy_screen_output)
+        self.screen_copy_btn.setEnabled(False)
+        controls.addWidget(self.screen_copy_btn)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -864,49 +950,37 @@ class ScreeningPage(QFrame):
         layout.addWidget(self.progress)
 
         # ── 输出区 ──
-        self.output = QFrame()
-        self.output.setObjectName("card")
-        out_layout = QVBoxLayout(self.output)
-        out_layout.setContentsMargins(0, 0, 0, 0)
+        self.screen_output_text = QTextEdit()
+        self.screen_output_text.setReadOnly(True)
+        self.screen_output_text.setPlaceholderText("选股结果将在此显示...")
+        self.screen_output_text.setStyleSheet("QTextEdit { background: transparent; color: #c0caf5; font-family: 'Consolas', monospace; font-size: 12px; border: 1px solid #3b4261; border-radius: 6px; padding: 16px; }")
+        layout.addWidget(self.screen_output_text, stretch=1)
 
-        # 使用滚动区域
-        from PySide6.QtWidgets import QScrollArea
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("background: transparent;")
-        self.scroll_content = QWidget()
-        self.scroll_content.setStyleSheet("background: transparent;")
-        self._scroll_layout = QVBoxLayout(self.scroll_content)
-        self._scroll_layout.setContentsMargins(16, 16, 16, 16)
-        self._scroll_layout.setSpacing(4)
-        self._scroll_layout.addStretch()
-        scroll.setWidget(self.scroll_content)
-        out_layout.addWidget(scroll)
-        layout.addWidget(self.output, stretch=1)
+        self._results_container = QWidget()
+        self._results_container.setStyleSheet("background: transparent;")
+        self._results_layout = QVBoxLayout(self._results_container)
+        self._results_layout.setContentsMargins(0, 0, 0, 0)
+        self._results_layout.setSpacing(4)
+        self._results_container.setVisible(False)
+        layout.addWidget(self._results_container)
+        self._running = False
 
     def _append(self, text: str):
-        if self._scroll_layout.count() > 0:
-            last = self._scroll_layout.itemAt(self._scroll_layout.count() - 1)
-            if last and last.spacerItem():
-                self._scroll_layout.removeItem(last)
-        from PySide6.QtWidgets import QLabel
-        lbl = QLabel(text)
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet("color: #c0caf5; font-family: 'Consolas', monospace; "
-                          "font-size: 12px; background: transparent;")
-        lbl.setTextFormat(Qt.PlainText)
-        self._scroll_layout.addWidget(lbl)
-        self._scroll_layout.addStretch()
+        if not self._running:
+            return
+        self.screen_output_text.append(text.rstrip('\n'))
 
     def _clear(self):
         """清除之前的选股结果。"""
-        while self._scroll_layout.count() > 0:
-            item = self._scroll_layout.takeAt(0)
+        self._running = True
+        self.screen_copy_btn.setEnabled(False)
+        self.screen_output_text.clear()
+        while self._results_layout.count() > 0:
+            item = self._results_layout.takeAt(0)
             if item.widget():
                 item.widget().setParent(None)
                 item.widget().deleteLater()
-        self._scroll_layout.addStretch()
+        self._results_container.setVisible(False)
         if hasattr(self, 'results_table'):
             self.results_table = None
 
@@ -937,12 +1011,14 @@ class ScreeningPage(QFrame):
     def _on_screen_done(self, stocks):
         self.screen_btn.setEnabled(True)
         self.screen_btn.setText("🎯 开始智能选股")
+        self.screen_copy_btn.setEnabled(True)
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         QTimer.singleShot(500, lambda: self.progress.setVisible(False))
 
         if not stocks:
             self._append("⚠ 未筛选出符合条件的股票\n")
+            self._running = False
             return
 
         # 构建结果表格
@@ -990,8 +1066,9 @@ class ScreeningPage(QFrame):
         self.results_table.cellDoubleClicked.connect(self._on_table_clicked)
         self.results_table.setFixedHeight(min(len(stocks) * 36 + 30, 400))
 
-        # 添加到滚动区域
-        self._scroll_layout.addWidget(self.results_table)
+        # 添加到结果区域
+        self._results_layout.addWidget(self.results_table)
+        self._results_container.setVisible(True)
 
         # DeepSeek 分析明细
         ds_stocks = [s for s in stocks if s.get("deepseek_signal")]
@@ -999,10 +1076,10 @@ class ScreeningPage(QFrame):
             from PySide6.QtWidgets import QLabel
             sep = QLabel("\n" + "─" * 40)
             sep.setStyleSheet("color: #565f89;")
-            self._scroll_layout.addWidget(sep)
+            self._results_layout.addWidget(sep)
             header = QLabel("DeepSeek V4 Pro 分析:")
             header.setStyleSheet("font-weight: 600; color: #7aa2f7; font-size: 13px; padding: 4px 0;")
-            self._scroll_layout.addWidget(header)
+            self._results_layout.addWidget(header)
             for s in ds_stocks:
                 sig = s.get("deepseek_signal", "?")
                 conf = s.get("deepseek_confidence", 0)
@@ -1010,13 +1087,31 @@ class ScreeningPage(QFrame):
                 line = QLabel(f"  {s.get('symbol','')} {s.get('name','')} → {sig} (置信度{conf:.0%}) {rationale}")
                 line.setWordWrap(True)
                 line.setStyleSheet("color: #c0caf5; font-size: 12px; padding: 2px 0;")
-                self._scroll_layout.addWidget(line)
+                self._results_layout.addWidget(line)
+
+        self._running = False
 
     def _on_screen_error(self, msg):
         self.screen_btn.setEnabled(True)
         self.screen_btn.setText("🎯 开始智能选股")
         self.progress.setVisible(False)
+        self.screen_copy_btn.setEnabled(True)
         self._append(f"\n❌ 选股失败: {msg}\n")
+        self._running = False
+
+    def _copy_screen_output(self):
+        """收集选股输出区域所有文本并复制到剪贴板。"""
+        text = self.screen_output_text.toPlainText()
+        if text.strip():
+            QApplication.clipboard().setText(text)
+            self.screen_copy_btn.setText("✅ 已复制")
+            QTimer.singleShot(2000, lambda: self.screen_copy_btn.setText("📋 复制报告"))
+        else:
+            self.screen_copy_btn.setText("⚠ 无内容")
+            QTimer.singleShot(2000, lambda: self.screen_copy_btn.setText("📋 复制报告"))
+        w = self.window()
+        if w and hasattr(w, 'copy_to_clipboard'):
+            w.copy_to_clipboard(text)
 
     def _on_table_clicked(self, row, col):
         if not hasattr(self, 'results_table') or not self.results_table:
@@ -1140,6 +1235,10 @@ class EvolutionPage(QFrame):
             current_tab.set_loading(False)
         if hasattr(current_tab, '_append'):
             current_tab._append(f"\n❌ 错误: {msg}\n")
+            if hasattr(current_tab, '_running'):
+                current_tab._running = False
+        if hasattr(current_tab, 'copy_btn'):
+            current_tab.copy_btn.setEnabled(True)
 
 
 # ── 子标签1: 回测实验室 ──
@@ -1191,6 +1290,12 @@ class BacktestLabTab(QFrame):
         self.start_btn.setFixedWidth(150)
         self.start_btn.clicked.connect(self._on_start)
         ctrl.addWidget(self.start_btn)
+
+        self.copy_btn = ModernButton("📋 复制报告")
+        self.copy_btn.setFixedWidth(120)
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.clicked.connect(self._copy_output)
+        ctrl.addWidget(self.copy_btn)
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
@@ -1202,19 +1307,12 @@ class BacktestLabTab(QFrame):
         layout.addWidget(self.progress)
 
         # Output area
-        from PySide6.QtWidgets import QScrollArea
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("background: transparent;")
-        self.scroll_content = QWidget()
-        self.scroll_content.setStyleSheet("background: transparent;")
-        self._scroll_layout = QVBoxLayout(self.scroll_content)
-        self._scroll_layout.setContentsMargins(8, 8, 8, 8)
-        self._scroll_layout.setSpacing(4)
-        self._scroll_layout.addStretch()
-        scroll.setWidget(self.scroll_content)
-        layout.addWidget(scroll, stretch=1)
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setPlaceholderText("回测结果将在此显示...")
+        self.output_text.setStyleSheet("QTextEdit { background: transparent; color: #c0caf5; font-family: 'Consolas', monospace; font-size: 12px; border: 1px solid #3b4261; border-radius: 6px; padding: 16px; }")
+        layout.addWidget(self.output_text, stretch=1)
+        self._running = False
 
     def _on_start(self):
         sym = self.symbol_input.text().strip()
@@ -1230,24 +1328,14 @@ class BacktestLabTab(QFrame):
         self.progress.setVisible(loading)
 
     def _clear_results(self):
-        while self._scroll_layout.count() > 0:
-            item = self._scroll_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-                item.widget().deleteLater()
-        self._scroll_layout.addStretch()
+        self._running = True
+        self.copy_btn.setEnabled(False)
+        self.output_text.clear()
 
     def _append(self, text: str):
-        if self._scroll_layout.count() > 0:
-            last = self._scroll_layout.itemAt(self._scroll_layout.count() - 1)
-            if last and last.spacerItem():
-                self._scroll_layout.removeItem(last)
-        lbl = QLabel(text)
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet("color: #c0caf5; font-family: 'Consolas', monospace; font-size: 12px; background: transparent;")
-        lbl.setTextFormat(Qt.PlainText)
-        self._scroll_layout.addWidget(lbl)
-        self._scroll_layout.addStretch()
+        if not self._running:
+            return
+        self.output_text.append(text.rstrip('\n'))
 
     def _show_results(self, result):
         rounds = result.get("rounds", [])
@@ -1266,6 +1354,21 @@ class BacktestLabTab(QFrame):
             self._append(f"  Δ收益: {delta_ret:+.2f}%  Δ夏普: {delta_sharpe:+.2f}")
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
+        self.copy_btn.setEnabled(True)
+        self._running = False
+
+    def _copy_output(self):
+        text = self.output_text.toPlainText()
+        if text.strip():
+            QApplication.clipboard().setText(text)
+            self.copy_btn.setText("✅ 已复制")
+            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
+        else:
+            self.copy_btn.setText("⚠ 无内容")
+            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
+        w = self.window()
+        if w and hasattr(w, 'copy_to_clipboard'):
+            w.copy_to_clipboard(text)
 
 
 # ── 子标签2: 自适应迁移 ──
@@ -1292,6 +1395,12 @@ class AdaptiveMigrationTab(QFrame):
         self.adapt_btn.setFixedWidth(170)
         self.adapt_btn.clicked.connect(lambda: self.adapt_requested.emit(self.symbol_input.text().strip()))
         ctrl.addWidget(self.adapt_btn)
+
+        self.copy_btn = ModernButton("📋 复制报告")
+        self.copy_btn.setFixedWidth(120)
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.clicked.connect(self._copy_output)
+        ctrl.addWidget(self.copy_btn)
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
@@ -1301,43 +1410,40 @@ class AdaptiveMigrationTab(QFrame):
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
 
-        from PySide6.QtWidgets import QScrollArea
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("background: transparent;")
-        self.scroll_content = QWidget()
-        self.scroll_content.setStyleSheet("background: transparent;")
-        self._scroll_layout = QVBoxLayout(self.scroll_content)
-        self._scroll_layout.setContentsMargins(8, 8, 8, 8)
-        self._scroll_layout.setSpacing(4)
-        self._scroll_layout.addStretch()
-        scroll.setWidget(self.scroll_content)
-        layout.addWidget(scroll, stretch=1)
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setPlaceholderText("自适应迁移结果将在此显示...")
+        self.output_text.setStyleSheet("QTextEdit { background: transparent; color: #c0caf5; font-family: 'Consolas', monospace; font-size: 12px; border: 1px solid #3b4261; border-radius: 6px; padding: 16px; }")
+        layout.addWidget(self.output_text, stretch=1)
+
+        self._results_container = QWidget()
+        self._results_container.setStyleSheet("background: transparent;")
+        self._results_layout = QVBoxLayout(self._results_container)
+        self._results_layout.setContentsMargins(0, 0, 0, 0)
+        self._results_layout.setSpacing(4)
+        self._results_container.setVisible(False)
+        layout.addWidget(self._results_container)
+        self._running = False
 
     def set_loading(self, loading: bool):
         self.adapt_btn.setEnabled(not loading)
         self.progress.setVisible(loading)
 
     def _clear(self):
-        while self._scroll_layout.count() > 0:
-            item = self._scroll_layout.takeAt(0)
+        self._running = True
+        self.copy_btn.setEnabled(False)
+        self.output_text.clear()
+        while self._results_layout.count() > 0:
+            item = self._results_layout.takeAt(0)
             if item.widget():
                 item.widget().setParent(None)
                 item.widget().deleteLater()
-        self._scroll_layout.addStretch()
+        self._results_container.setVisible(False)
 
     def _append(self, text: str):
-        if self._scroll_layout.count() > 0:
-            last = self._scroll_layout.itemAt(self._scroll_layout.count() - 1)
-            if last and last.spacerItem():
-                self._scroll_layout.removeItem(last)
-        lbl = QLabel(text)
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet("color: #c0caf5; font-family: 'Consolas', monospace; font-size: 12px; background: transparent;")
-        lbl.setTextFormat(Qt.PlainText)
-        self._scroll_layout.addWidget(lbl)
-        self._scroll_layout.addStretch()
+        if not self._running:
+            return
+        self.output_text.append(text.rstrip('\n'))
 
     def _show_results(self, result):
         base_feats = result.get("base_features", {})
@@ -1364,7 +1470,8 @@ class AdaptiveMigrationTab(QFrame):
                 table.setItem(i, 0, QTableWidgetItem(k))
                 table.setItem(i, 1, QTableWidgetItem(str(v)))
             table.setFixedHeight(150)
-            self._scroll_layout.addWidget(table)
+            self._results_layout.addWidget(table)
+            self._results_container.setVisible(True)
 
         # Parameter diff table
         if changes:
@@ -1380,7 +1487,8 @@ class AdaptiveMigrationTab(QFrame):
                 diff_table.setItem(i, 2, QTableWidgetItem(str(c.get("new_value", ""))))
                 diff_table.setItem(i, 3, QTableWidgetItem(c.get("reason", "")[:80]))
             diff_table.setFixedHeight(min(len(changes) * 30 + 35, 200))
-            self._scroll_layout.addWidget(diff_table)
+            self._results_layout.addWidget(diff_table)
+            self._results_container.setVisible(True)
 
         # Last round metrics
         if rounds:
@@ -1393,6 +1501,21 @@ class AdaptiveMigrationTab(QFrame):
         adjudication = result.get("adaptation_rationale", "")
         if adjudication:
             self._append(f"\n💬 Critic 点评: {adjudication[:120]}")
+        self.copy_btn.setEnabled(True)
+        self._running = False
+
+    def _copy_output(self):
+        text = self.output_text.toPlainText()
+        if text.strip():
+            QApplication.clipboard().setText(text)
+            self.copy_btn.setText("✅ 已复制")
+            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
+        else:
+            self.copy_btn.setText("⚠ 无内容")
+            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
+        w = self.window()
+        if w and hasattr(w, 'copy_to_clipboard'):
+            w.copy_to_clipboard(text)
 
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
@@ -1488,104 +1611,205 @@ class SettingsPage(QFrame):
         self._scheduler_running = False
 
         from utils.config import load_config, set_config_value, get_config_value
+        from PySide6.QtWidgets import QScrollArea, QSizePolicy as QSP
 
-        layout = QVBoxLayout(self)
+        # ── 最外层布局（0边距，确保 ScrollArea 填满整个页面）──
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── 滚动区域 ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # ── 滚动内容容器 ──
+        scroll_content = QWidget()
+        scroll_content.setObjectName("settingsScroll")
+        scroll_content.setStyleSheet("#settingsScroll { background: transparent; }")
+
+        # ── 主布局：垂直排列所有模块 ──
+        layout = QVBoxLayout(scroll_content)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
+        layout.setSpacing(24)
 
-        # ── API 配置 ──
-        api_group = QGroupBox("🔑 API 配置")
+        # ── 辅助函数：创建标准的行标签 ──
+        def _make_label(text, fixed_width=100):
+            lbl = QLabel(text)
+            lbl.setFixedWidth(fixed_width)
+            lbl.setStyleSheet("color: inherit; font-size: 13px;")
+            return lbl
+
+        # ═══════════════════════════════════════════════════════
+        # 模块1：API 配置
+        # ═══════════════════════════════════════════════════════
+        api_group = QGroupBox("🔑 API 配置 (DeepSeek V4 Pro)")
         api_layout = QVBoxLayout(api_group)
-        api_layout.setSpacing(8)
+        api_layout.setContentsMargins(16, 16, 16, 16)
+        api_layout.setSpacing(12)
 
         self.api_status = QLabel()
         self._refresh_api_status()
         api_layout.addWidget(self.api_status)
 
-        api_row = QHBoxLayout()
-        api_row.setSpacing(8)
+        # Base URL
+        url_row = QHBoxLayout(); url_row.setSpacing(10)
+        url_row.addWidget(_make_label("API 地址:"))
+        self.api_url_input = QLineEdit()
+        self.api_url_input.setPlaceholderText("https://api.deepseek.com")
+        self.api_url_input.setMinimumHeight(32)
+        saved_url = get_config_value("DEEPSEEK_BASE_URL")
+        if saved_url:
+            self.api_url_input.setText(saved_url)
+        url_row.addWidget(self.api_url_input, stretch=1)
+        api_layout.addLayout(url_row)
+
+        # Model
+        model_row = QHBoxLayout(); model_row.setSpacing(10)
+        model_row.addWidget(_make_label("模型名称:"))
+        self.api_model_input = QLineEdit()
+        self.api_model_input.setPlaceholderText("deepseek-v4-pro")
+        self.api_model_input.setMinimumHeight(32)
+        saved_model = get_config_value("DEEPSEEK_MODEL")
+        if saved_model:
+            self.api_model_input.setText(saved_model)
+        self.api_model_input.setToolTip("DeepSeek: deepseek-v4-pro / deepseek-chat\n硅基流动: deepseek-ai/DeepSeek-V3\n本地部署: 自定义模型名")
+        model_row.addWidget(self.api_model_input, stretch=1)
+        api_layout.addLayout(model_row)
+
+        # API Key
+        key_row = QHBoxLayout(); key_row.setSpacing(10)
+        key_row.addWidget(_make_label("API Key:"))
         self.api_key_input = QLineEdit()
         self.api_key_input.setPlaceholderText("输入 DeepSeek API Key (sk-...)")
         self.api_key_input.setEchoMode(QLineEdit.Password)
-        self.api_key_input.setFixedHeight(34)
+        self.api_key_input.setMinimumHeight(32)
         current_key = get_config_value("DEEPSEEK_API_KEY")
         if current_key:
             self.api_key_input.setText(current_key)
         self.api_show_btn = QPushButton("👁")
-        self.api_show_btn.setFixedSize(34, 34)
+        self.api_show_btn.setFixedSize(32, 32)
         self.api_show_btn.setCursor(Qt.PointingHandCursor)
+        self.api_show_btn.setStyleSheet("QPushButton { border: none; background: transparent; font-size: 16px; }")
         self.api_show_btn.clicked.connect(lambda: self._toggle_password_visible(self.api_key_input, self.api_show_btn))
-        self.api_save_btn = ModernButton("💾 保存", primary=True)
-        self.api_save_btn.setFixedWidth(80)
-        self.api_save_btn.clicked.connect(self._save_api_key)
-        api_row.addWidget(self.api_key_input, stretch=1)
-        api_row.addWidget(self.api_show_btn)
-        api_row.addWidget(self.api_save_btn)
-        api_layout.addLayout(api_row)
+        key_row.addWidget(self.api_key_input, stretch=1)
+        key_row.addWidget(self.api_show_btn)
+        api_layout.addLayout(key_row)
 
-        api_note = QLabel("API Key 保存在本地 config.json，仅用于本应用调用 DeepSeek。")
+        # Temperature + Max Tokens + Timeout
+        params_row = QHBoxLayout(); params_row.setSpacing(10)
+        params_row.addWidget(_make_label("温度:", 50))
+        self.api_temp_spin = QDoubleSpinBox()
+        self.api_temp_spin.setRange(0.0, 2.0)
+        self.api_temp_spin.setSingleStep(0.1)
+        self.api_temp_spin.setDecimals(1)
+        saved_temp = get_config_value("DEEPSEEK_TEMPERATURE")
+        self.api_temp_spin.setValue(float(saved_temp) if saved_temp else 0.7)
+        self.api_temp_spin.setFixedWidth(70)
+        self.api_temp_spin.setMinimumHeight(32)
+        params_row.addWidget(self.api_temp_spin)
+
+        params_row.addWidget(_make_label("最大Token:", 75))
+        self.api_tokens_spin = QSpinBox()
+        self.api_tokens_spin.setRange(512, 32768)
+        self.api_tokens_spin.setSingleStep(512)
+        saved_tokens = get_config_value("DEEPSEEK_MAX_TOKENS")
+        self.api_tokens_spin.setValue(int(saved_tokens) if saved_tokens else 8192)
+        self.api_tokens_spin.setFixedWidth(90)
+        self.api_tokens_spin.setMinimumHeight(32)
+        params_row.addWidget(self.api_tokens_spin)
+
+        params_row.addWidget(_make_label("超时(s):", 60))
+        self.api_timeout_spin = QSpinBox()
+        self.api_timeout_spin.setRange(30, 600)
+        self.api_timeout_spin.setSingleStep(10)
+        saved_timeout = get_config_value("DEEPSEEK_TIMEOUT")
+        self.api_timeout_spin.setValue(int(saved_timeout) if saved_timeout else 30)
+        self.api_timeout_spin.setFixedWidth(70)
+        self.api_timeout_spin.setMinimumHeight(32)
+        params_row.addWidget(self.api_timeout_spin)
+        params_row.addStretch()
+        api_layout.addLayout(params_row)
+
+        # 按钮行：预设 + 测试 + 保存
+        btn_row = QHBoxLayout(); btn_row.setSpacing(10)
+        self.preset_deepseek_btn = ModernButton("🔄 DeepSeek官方")
+        self.preset_deepseek_btn.clicked.connect(self._preset_deepseek)
+        btn_row.addWidget(self.preset_deepseek_btn)
+        self.preset_silicon_btn = ModernButton("🔬 硅基流动")
+        self.preset_silicon_btn.clicked.connect(self._preset_siliconflow)
+        btn_row.addWidget(self.preset_silicon_btn)
+        btn_row.addStretch()
+        self.api_test_btn = ModernButton("🔗 测试连接")
+        self.api_test_btn.clicked.connect(self._test_api_connection)
+        btn_row.addWidget(self.api_test_btn)
+        self.api_save_btn = ModernButton("💾 保存配置", primary=True)
+        self.api_save_btn.clicked.connect(self._save_api_config)
+        btn_row.addWidget(self.api_save_btn)
+        api_layout.addLayout(btn_row)
+
+        api_note = QLabel("配置保存在本地 config.json。支持所有兼容 OpenAI 接口的 API 服务（DeepSeek、硅基流动、本地部署等）。")
         api_note.setObjectName("cardTitle")
         api_note.setWordWrap(True)
         api_layout.addWidget(api_note)
         layout.addWidget(api_group)
 
-        # ── 邮件配置 ──
+        # ═══════════════════════════════════════════════════════
+        # 模块2：邮件配置
+        # ═══════════════════════════════════════════════════════
         mail_group = QGroupBox("📧 邮件配置 (QQ邮箱)")
         mail_layout = QVBoxLayout(mail_group)
-        mail_layout.setSpacing(8)
+        mail_layout.setContentsMargins(16, 16, 16, 16)
+        mail_layout.setSpacing(12)
 
         self.mail_status = QLabel()
         self._refresh_mail_status()
         mail_layout.addWidget(self.mail_status)
 
-        # 邮箱地址
-        addr_row = QHBoxLayout()
-        addr_row.setSpacing(8)
-        addr_row.addWidget(QLabel("邮箱地址:"))
+        addr_row = QHBoxLayout(); addr_row.setSpacing(10)
+        addr_row.addWidget(_make_label("邮箱地址:"))
         self.mail_addr_input = QLineEdit()
         self.mail_addr_input.setPlaceholderText("your_email@qq.com")
-        self.mail_addr_input.setFixedHeight(34)
+        self.mail_addr_input.setMinimumHeight(32)
         saved_addr = get_config_value("EMAIL_ADDRESS")
         if saved_addr:
             self.mail_addr_input.setText(saved_addr)
         addr_row.addWidget(self.mail_addr_input, stretch=1)
         mail_layout.addLayout(addr_row)
 
-        # 授权码
-        pwd_row = QHBoxLayout()
-        pwd_row.setSpacing(8)
-        pwd_row.addWidget(QLabel("授权码:"))
+        pwd_row = QHBoxLayout(); pwd_row.setSpacing(10)
+        pwd_row.addWidget(_make_label("授权码:"))
         self.mail_pwd_input = QLineEdit()
         self.mail_pwd_input.setPlaceholderText("QQ邮箱授权码 (在QQ邮箱设置→账户中生成)")
         self.mail_pwd_input.setEchoMode(QLineEdit.Password)
-        self.mail_pwd_input.setFixedHeight(34)
+        self.mail_pwd_input.setMinimumHeight(32)
         saved_pwd = get_config_value("EMAIL_PASSWORD")
         if saved_pwd:
             self.mail_pwd_input.setText(saved_pwd)
         self.mail_pwd_show_btn = QPushButton("👁")
-        self.mail_pwd_show_btn.setFixedSize(34, 34)
+        self.mail_pwd_show_btn.setFixedSize(32, 32)
         self.mail_pwd_show_btn.setCursor(Qt.PointingHandCursor)
+        self.mail_pwd_show_btn.setStyleSheet("QPushButton { border: none; background: transparent; font-size: 16px; }")
         self.mail_pwd_show_btn.clicked.connect(lambda: self._toggle_password_visible(self.mail_pwd_input, self.mail_pwd_show_btn))
         pwd_row.addWidget(self.mail_pwd_input, stretch=1)
         pwd_row.addWidget(self.mail_pwd_show_btn)
         mail_layout.addLayout(pwd_row)
 
-        # 收件人
-        recip_row = QHBoxLayout()
-        recip_row.setSpacing(8)
-        recip_row.addWidget(QLabel("报告收件人:"))
+        recip_row = QHBoxLayout(); recip_row.setSpacing(10)
+        recip_row.addWidget(_make_label("报告收件人:"))
         self.recip_input = QLineEdit()
         self.recip_input.setPlaceholderText("接收每日报告的邮箱 (默认同发件地址)")
-        self.recip_input.setFixedHeight(34)
+        self.recip_input.setMinimumHeight(32)
         saved_recip = get_config_value("REPORT_RECIPIENT")
         if saved_recip:
             self.recip_input.setText(saved_recip)
         recip_row.addWidget(self.recip_input, stretch=1)
         mail_layout.addLayout(recip_row)
 
-        # 邮件操作按钮
-        mail_btn_row = QHBoxLayout()
-        mail_btn_row.setSpacing(12)
+        # 邮件按钮行
+        mail_btn_row = QHBoxLayout(); mail_btn_row.setSpacing(10)
         self.mail_save_btn = ModernButton("💾 保存邮件配置", primary=True)
         self.mail_save_btn.clicked.connect(self._save_mail_config)
         self.mail_test_btn = ModernButton("📧 测试发送")
@@ -1595,12 +1819,10 @@ class SettingsPage(QFrame):
         mail_btn_row.addStretch()
         mail_layout.addLayout(mail_btn_row)
 
-        # 邮件监听开关
-        listener_row = QHBoxLayout()
-        listener_row.setSpacing(12)
+        # 邮件监听
+        listener_row = QHBoxLayout(); listener_row.setSpacing(10)
         self.listener_status = QLabel("邮件监听: 未启动")
         self.listener_toggle = ModernButton("▶ 启动邮件监听", primary=True)
-        self.listener_toggle.setFixedWidth(180)
         self.listener_toggle.clicked.connect(self._toggle_mail_listener_local)
         self._listener_running = False
         listener_row.addWidget(self.listener_status)
@@ -1608,49 +1830,78 @@ class SettingsPage(QFrame):
         listener_row.addStretch()
         mail_layout.addLayout(listener_row)
 
-        mail_note = QLabel("使用 QQ邮箱 SMTP (smtp.qq.com:465 SSL)。授权码在 QQ邮箱网页版「设置→账户→POP3/SMTP服务」中生成，不是QQ密码。\n"
+        mail_note = QLabel("使用 QQ邮箱 SMTP (smtp.qq.com:465 SSL)。授权码在 QQ邮箱网页版「设置→账户→POP3/SMTP服务」中生成。\n"
                           "邮件监听启动后，每60秒自动检查未读邮件中的 [StockMind] 指令。")
         mail_note.setObjectName("cardTitle")
         mail_note.setWordWrap(True)
         mail_layout.addWidget(mail_note)
         layout.addWidget(mail_group)
 
-        # ── 定时任务 ──
+        # ═══════════════════════════════════════════════════════
+        # 模块3：定时任务
+        # ═══════════════════════════════════════════════════════
         sched_group = QGroupBox("⏰ 定时任务")
         sched_layout = QVBoxLayout(sched_group)
-        sched_layout.setSpacing(8)
+        sched_layout.setContentsMargins(16, 16, 16, 16)
+        sched_layout.setSpacing(12)
 
         self.sched_status = QLabel("状态: 未启动")
         self.sched_toggle = ModernButton("▶ 启动调度器", primary=True)
-        self.sched_toggle.setFixedWidth(180)
         self.sched_toggle.clicked.connect(self._toggle_scheduler)
         sched_layout.addWidget(self.sched_status)
         sched_layout.addWidget(self.sched_toggle)
 
-        sched_info = QLabel("每日 09:30 开盘简报 | 11:30 午盘回顾 | 15:00 收盘总结\n"
-                            "定时刷新持仓 → 智能选股 → 发送邮件报告\n"
-                            "（需先在邮件配置中设置 QQ邮箱 地址和授权码）")
+        sched_info = QLabel("每日 09:30 开盘简报 | 11:30 午盘回顾 | 15:00 收盘总结\n定时刷新持仓 → 智能选股 → 发送邮件报告")
         sched_info.setObjectName("cardTitle")
         sched_info.setWordWrap(True)
         sched_layout.addWidget(sched_info)
         layout.addWidget(sched_group)
 
-        # ── 外观 ──
+        # ═══════════════════════════════════════════════════════
+        # 模块4：外观
+        # ═══════════════════════════════════════════════════════
         theme_group = QGroupBox("🎨 外观")
         theme_layout = QVBoxLayout(theme_group)
-        theme_layout.setSpacing(8)
+        theme_layout.setContentsMargins(16, 16, 16, 16)
+        theme_layout.setSpacing(12)
 
         self.theme_status = QLabel("当前主题: 暗黑模式")
         self.theme_toggle_btn = ModernButton("☀️ 切换亮色主题")
-        self.theme_toggle_btn.setFixedWidth(180)
         self.theme_toggle_btn.clicked.connect(self._toggle_theme)
         theme_layout.addWidget(self.theme_status)
         theme_layout.addWidget(self.theme_toggle_btn)
         layout.addWidget(theme_group)
 
-        # ── 关于 ──
+        # ═══════════════════════════════════════════════════════
+        # 模块5：快捷方式
+        # ═══════════════════════════════════════════════════════
+        shortcut_group = QGroupBox("📌 快捷方式")
+        shortcut_layout = QVBoxLayout(shortcut_group)
+        shortcut_layout.setContentsMargins(16, 16, 16, 16)
+        shortcut_layout.setSpacing(12)
+
+        shortcut_btn_row = QHBoxLayout(); shortcut_btn_row.setSpacing(10)
+        self.create_shortcut_btn = ModernButton("🖥 创建桌面快捷方式", primary=True)
+        self.create_shortcut_btn.clicked.connect(self._create_desktop_shortcut)
+        self.shortcut_status = QLabel("")
+        self.shortcut_status.setObjectName("cardTitle")
+        self.shortcut_status.setWordWrap(True)
+        shortcut_btn_row.addWidget(self.create_shortcut_btn)
+        shortcut_btn_row.addWidget(self.shortcut_status, stretch=1)
+        shortcut_btn_row.addStretch()
+        shortcut_layout.addLayout(shortcut_btn_row)
+
+        QTimer.singleShot(500, self._check_shortcut_exists)
+        layout.addWidget(shortcut_group)
+
+        # ═══════════════════════════════════════════════════════
+        # 模块6：关于
+        # ═══════════════════════════════════════════════════════
         about_group = QGroupBox("ℹ️ 关于")
         about_layout = QVBoxLayout(about_group)
+        about_layout.setContentsMargins(16, 16, 16, 16)
+        about_layout.setSpacing(12)
+
         about_lbl = QLabel("StockMind v2.0 — 多Agent 深度股析系统\n"
                            "基于 PySide6 + DeepSeek V4 Pro\n"
                            "数据来源: 腾讯行情 | ifzq K线 | 东方财富新闻/财务")
@@ -1658,7 +1909,63 @@ class SettingsPage(QFrame):
         about_layout.addWidget(about_lbl)
         layout.addWidget(about_group)
 
+        # ── 底部弹性空间 ──
         layout.addStretch()
+
+        # ── 组装滚动区域 ──
+        scroll.setWidget(scroll_content)
+        outer.addWidget(scroll)
+
+    def _create_desktop_shortcut(self):
+        import os
+        import sys
+        import pythoncom
+        from win32com.client import Dispatch
+        try:
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            shortcut_path = os.path.join(desktop, "StockMind.lnk")
+
+            if getattr(sys, 'frozen', False):
+                target_path = sys.executable
+                work_dir = os.path.dirname(sys.executable)
+            else:
+                target_path = sys.executable
+                work_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                # 使用 pythonw 启动 desktop_app.py (无控制台窗口)
+                script_path = os.path.join(work_dir, "desktop_app.py")
+
+            pythoncom.CoInitialize()
+            shell = Dispatch('WScript.Shell')
+            shortcut = shell.CreateShortCut(shortcut_path)
+            shortcut.Targetpath = target_path
+            if getattr(sys, 'frozen', False):
+                shortcut.Arguments = ""
+            else:
+                shortcut.Arguments = f'"{script_path}"'
+            shortcut.WorkingDirectory = work_dir
+            shortcut.IconLocation = target_path if getattr(sys, 'frozen', False) else os.path.join(work_dir, "assets", "stock.ico")
+            shortcut.Description = "StockMind - 多Agent深度股析系统"
+            shortcut.save()
+            pythoncom.CoUninitialize()
+
+            self.shortcut_status.setText("✅ 桌面快捷方式已创建")
+            self.shortcut_status.setStyleSheet("color: #9ece6a;")
+            QMessageBox.information(self, "成功", f"桌面快捷方式已创建:\n{shortcut_path}")
+        except Exception as e:
+            self.shortcut_status.setText(f"❌ 创建失败: {e}")
+            self.shortcut_status.setStyleSheet("color: #f7768e;")
+            QMessageBox.warning(self, "失败", f"创建快捷方式失败:\n{e}\n\n请确认已安装 pywin32 模块。")
+
+    def _check_shortcut_exists(self):
+        import os
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        shortcut_path = os.path.join(desktop, "StockMind.lnk")
+        if os.path.exists(shortcut_path):
+            self.shortcut_status.setText("✅ 桌面快捷方式已存在")
+            self.shortcut_status.setStyleSheet("color: #9ece6a;")
+        else:
+            self.shortcut_status.setText("💡 点击左侧按钮在桌面创建快捷方式")
+            self.shortcut_status.setStyleSheet("color: #7982a9;")
 
     def _toggle_password_visible(self, input_widget, toggle_btn):
         if input_widget.echoMode() == QLineEdit.Password:
@@ -1671,25 +1978,91 @@ class SettingsPage(QFrame):
     def _refresh_api_status(self):
         from utils.config import get_config_value
         key = get_config_value("DEEPSEEK_API_KEY")
+        url = get_config_value("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
+        model = get_config_value("DEEPSEEK_MODEL") or "deepseek-v4-pro"
         if key:
             masked = key[:8] + "…" + key[-4:] if len(key) > 12 else "已设置"
-            self.api_status.setText(f"DeepSeek API Key: ✅ {masked}")
+            self.api_status.setText(f"✅ {model} @ {url} | Key: {masked}")
             self.api_status.setObjectName("statusOk")
         else:
-            self.api_status.setText("DeepSeek API Key: ❌ 未设置")
+            self.api_status.setText(f"❌ 未设置 API Key | {model} @ {url}")
             self.api_status.setObjectName("statusError")
         self.api_status.style().unpolish(self.api_status)
         self.api_status.style().polish(self.api_status)
 
-    def _save_api_key(self):
+    def _save_api_config(self):
         from utils.config import set_config_value
+        from data.deepseek import reload_config
+        url = self.api_url_input.text().strip()
+        model = self.api_model_input.text().strip()
         key = self.api_key_input.text().strip()
-        if key:
-            set_config_value("DEEPSEEK_API_KEY", key)
-            self._refresh_api_status()
-            QMessageBox.information(self, "成功", "API Key 已保存")
-        else:
+        temperature = self.api_temp_spin.value()
+        max_tokens = self.api_tokens_spin.value()
+        timeout = self.api_timeout_spin.value()
+
+        if not key:
             QMessageBox.warning(self, "提示", "请输入 API Key")
+            return
+
+        set_config_value("DEEPSEEK_BASE_URL", url or "https://api.deepseek.com")
+        set_config_value("DEEPSEEK_MODEL", model or "deepseek-v4-pro")
+        set_config_value("DEEPSEEK_API_KEY", key)
+        set_config_value("DEEPSEEK_TEMPERATURE", str(temperature))
+        set_config_value("DEEPSEEK_MAX_TOKENS", str(max_tokens))
+        set_config_value("DEEPSEEK_TIMEOUT", str(timeout))
+        reload_config()
+        self._refresh_api_status()
+        QMessageBox.information(self, "成功", "API 配置已保存并生效")
+
+    def _test_api_connection(self):
+        self.api_test_btn.setEnabled(False)
+        self.api_test_btn.setText("⏳ 测试中...")
+        from utils.config import set_config_value
+        from data.deepseek import reload_config
+        # 先临时保存当前配置
+        url = self.api_url_input.text().strip()
+        model = self.api_model_input.text().strip()
+        key = self.api_key_input.text().strip()
+        if not key:
+            QMessageBox.warning(self, "提示", "请先输入 API Key")
+            self.api_test_btn.setEnabled(True)
+            self.api_test_btn.setText("🔗 测试连接")
+            return
+        set_config_value("DEEPSEEK_BASE_URL", url or "https://api.deepseek.com")
+        set_config_value("DEEPSEEK_MODEL", model or "deepseek-v4-pro")
+        set_config_value("DEEPSEEK_API_KEY", key)
+        reload_config()
+
+        def _test():
+            from data.deepseek import deepseek_chat
+            try:
+                reply = deepseek_chat("用一句话回答。", "请说：连接成功")
+                return True, reply[:200]
+            except Exception as e:
+                return False, str(e)
+
+        import threading
+        def _run_test():
+            ok, msg = _test()
+            self.api_test_btn.setEnabled(True)
+            self.api_test_btn.setText("🔗 测试连接")
+            if ok:
+                QMessageBox.information(self, "连接成功", f"API 响应正常:\n{msg}")
+            else:
+                QMessageBox.warning(self, "连接失败", f"API 请求失败:\n{msg}\n\n请检查:\n1. API 地址是否正确\n2. API Key 是否有效\n3. 网络连接是否正常")
+
+        t = threading.Thread(target=_run_test, daemon=True)
+        t.start()
+
+    def _preset_deepseek(self):
+        self.api_url_input.setText("https://api.deepseek.com")
+        self.api_model_input.setText("deepseek-v4-pro")
+        QMessageBox.information(self, "已切换", "已设置为 DeepSeek 官方 API\n地址: https://api.deepseek.com\n模型: deepseek-v4-pro")
+
+    def _preset_siliconflow(self):
+        self.api_url_input.setText("https://api.siliconflow.cn/v1")
+        self.api_model_input.setText("deepseek-ai/DeepSeek-V3")
+        QMessageBox.information(self, "已切换", "已设置为硅基流动 API\n地址: https://api.siliconflow.cn/v1\n模型: deepseek-ai/DeepSeek-V3\n请填入硅基流动的 API Key")
 
     def _refresh_mail_status(self):
         from utils.config import get_config_value
@@ -1805,10 +2178,11 @@ class MainWindow(QMainWindow):
 
         # 窗口属性
         self.setWindowTitle("StockMind")
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinMaxButtonsHint)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.resize(1100, 760)
         self.setMinimumSize(800, 600)
+        self._border_width = 8  # 边框可拖拽宽度
 
         # 中心 widget
         central = QWidget()
@@ -1869,6 +2243,15 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.stack, stretch=1)
         main_layout.addWidget(content, stretch=1)
 
+        # ── 状态栏 ──
+        self._status_bar = QStatusBar()
+        self._status_bar.setStyleSheet(
+            "QStatusBar { background: #1a1b2e; color: #7982a9; border-top: 1px solid #3b4261; "
+            "font-size: 11px; padding: 2px 8px; }"
+        )
+        self._status_bar.showMessage("就绪")
+        main_layout.addWidget(self._status_bar)
+
         # ── 信号连接 ──
         self.overview.analyze_requested.connect(self._jump_to_analysis)
         self.screening.analyze_requested.connect(self._jump_to_analysis)
@@ -1894,6 +2277,86 @@ class MainWindow(QMainWindow):
 
         # ── 启动邮件监听 ──
         QTimer.singleShot(3000, self._auto_start_mail_listener)
+
+    # ── 原生事件（窗口边框拖拽 + Aero Snap）──
+    def nativeEvent(self, eventType, message):
+        """处理 Windows WM_NCHITTEST 以支持边框缩放和 Aero Snap。"""
+        if sys.platform != 'win32':
+            return False, 0
+        try:
+            import ctypes
+            from ctypes import wintypes
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if msg.message != 0x0084:  # WM_NCHITTEST
+                return False, 0
+
+            # 最大化时不处理边框拖拽
+            if self.isMaximized():
+                x = msg.lParam & 0xFFFF
+                y = (msg.lParam >> 16) & 0xFFFF
+                title_bar_height = self.title_bar.height()
+                if y < self.geometry().top() + title_bar_height:
+                    return True, 2  # HTCAPTION — 允许拖动还原
+                return False, 0
+
+            x = msg.lParam & 0xFFFF
+            y = (msg.lParam >> 16) & 0xFFFF
+            rect = self.geometry()
+            left, right = rect.left(), rect.right()
+            top, bottom = rect.top(), rect.bottom()
+            bw = self._border_width
+            on_left = x < left + bw
+            on_right = x > right - bw
+            on_top = y < top + bw
+            on_bottom = y > bottom - bw
+            if on_top and on_left:
+                return True, 13  # HTTOPLEFT
+            if on_top and on_right:
+                return True, 14  # HTTOPRIGHT
+            if on_bottom and on_left:
+                return True, 16  # HTBOTTOMLEFT
+            if on_bottom and on_right:
+                return True, 17  # HTBOTTOMRIGHT
+            if on_left:
+                return True, 10  # HTLEFT
+            if on_right:
+                return True, 11  # HTRIGHT
+            if on_top:
+                return True, 12  # HTTOP
+            if on_bottom:
+                return True, 15  # HTBOTTOM
+            title_bar_height = self.title_bar.height()
+            if y < top + title_bar_height:
+                return True, 2   # HTCAPTION
+        except Exception:
+            pass
+        return False, 0
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange:
+            if self.isMaximized():
+                self.title_bar.max_btn.setText("🗗")
+            else:
+                self.title_bar.max_btn.setText("🗖")
+        super().changeEvent(event)
+
+    def _minimize_window(self):
+        """可靠的最小化：优先使用 Windows API。"""
+        if sys.platform == 'win32':
+            import ctypes
+            hwnd = int(self.winId())
+            ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        else:
+            self.showMinimized()
+
+    def _toggle_maximize(self):
+        """可靠的最大化/还原切换。"""
+        if self.isMaximized():
+            self.showNormal()
+            self.title_bar.max_btn.setText("🗖")
+        else:
+            self.showMaximized()
+            self.title_bar.max_btn.setText("🗗")
 
     # ── 页面切换 ──
     def _switch_page(self, index: int):
@@ -2029,12 +2492,31 @@ class MainWindow(QMainWindow):
         if reason == QSystemTrayIcon.DoubleClick:
             self.show_and_raise()
 
+    def copy_to_clipboard(self, text: str):
+        """通用复制函数：复制文本到剪贴板并在状态栏提示 3 秒。"""
+        if not text or not text.strip():
+            self._status_bar.showMessage("⚠ 无内容可复制")
+            QTimer.singleShot(3000, lambda: self._status_bar.showMessage("就绪"))
+            return
+        QApplication.clipboard().setText(text)
+        self._status_bar.showMessage("✅ 已复制到剪贴板")
+        QTimer.singleShot(3000, lambda: self._status_bar.showMessage("就绪"))
+
     def show_and_raise(self):
+        """从托盘恢复窗口，优先使用 Windows API 确保可靠显示。"""
+        if sys.platform == 'win32':
+            import ctypes
+            hwnd = int(self.winId())
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
         self.show()
+        if self.isMinimized():
+            self.showNormal()
         self.raise_()
         self.activateWindow()
 
     def hide_to_tray(self):
+        """隐藏到系统托盘。"""
         self.hide()
 
     def closeEvent(self, event):
@@ -2045,13 +2527,13 @@ class MainWindow(QMainWindow):
             event.accept()
 
     def quit_app(self):
-        if self._scheduler:
-            self._scheduler.running = False
         if self._tray_icon:
             self._tray_icon.hide()
+            self._tray_icon = None
+        if self._scheduler:
+            self._scheduler.running = False
         self.close()
         QApplication.quit()
-        os._exit(0)
 
 
 # ═══════════════════════════════════════════════════════════════

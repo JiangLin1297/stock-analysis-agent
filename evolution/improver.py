@@ -38,9 +38,14 @@ try:
 except Exception:
     pass
 
-EVOLUTION_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evolution_log.txt")
+def _data_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+EVOLUTION_LOG = os.path.join(_data_dir(), "evolution_log.txt")
 FILE_MOD_COUNT = defaultdict(int)
-EVOLUTION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evolution_state.json")
+EVOLUTION_STATE_FILE = os.path.join(_data_dir(), "evolution_state.json")
 
 # ═══════════════════════════════════════════════════════════════
 # 硬性收益目标
@@ -497,7 +502,7 @@ def evolve_full(max_iterations: int = 50, use_mock: bool = True, seed: int = Non
     if seed is not None:
         random.seed(seed)
 
-    project_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = _data_dir()
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗

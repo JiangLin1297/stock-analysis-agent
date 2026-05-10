@@ -8,7 +8,7 @@ import json
 def _data_dir() -> str:
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 CONFIG_FILE = os.path.join(_data_dir(), "config.json")

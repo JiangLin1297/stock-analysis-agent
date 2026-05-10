@@ -24,6 +24,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.pipeline import download_full_history, normalize_symbol
 
+def _data_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # ═══════════════════════════════════════════════════════════════
 # 1. 特征提取
 # ═══════════════════════════════════════════════════════════════
@@ -276,7 +281,7 @@ def generate_adapted_dna(symbol: str, base_params_path: str = "600744_best_param
     Returns:
         适配后的完整参数 dict（格式见 ADAPTATION_PROMPT 输出定义）
     """
-    project_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = _data_dir()
 
     # 1. 提取目标股票特征
     print(f"\n  [DNA生成] 提取 {symbol} 特征...")
@@ -598,7 +603,7 @@ def auto_adapt_and_backtest(symbol: str, time_frame: str = "mid",
         if extra_rounds > 0:
             print(f"\n  [迭代] 基于诊断结果追加 {extra_rounds} 轮改进...")
             from evolution.improver import apply_fix
-            project_dir = os.path.dirname(os.path.abspath(__file__))
+            project_dir = _data_dir()
             plan = diag.get("improvement_plan", {})
             short_fixes = plan.get("short_term", [])
             for fix in short_fixes[:2]:

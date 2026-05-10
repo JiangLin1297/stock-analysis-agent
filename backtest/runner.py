@@ -27,7 +27,12 @@ from backtest.engine import random_period_test, run_backtest, format_results
 from agents.critic import critique_backtest
 from evolution.improver import apply_fix, backup_file
 
-EVOLUTION_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_evolution_log.txt")
+def _data_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+EVOLUTION_LOG = os.path.join(_data_dir(), "backtest_evolution_log.txt")
 
 
 def log(msg: str, also_print: bool = True):

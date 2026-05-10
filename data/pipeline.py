@@ -35,7 +35,7 @@ SESSION.headers.update({
     ),
     "Referer": "https://finance.qq.com/",
 })
-TIMEOUT = 15
+TIMEOUT = (5, 30)  # (connect_timeout, read_timeout)
 
 
 def retry(max_attempts=3, base_delay=1.5):
@@ -756,7 +756,12 @@ def get_compressed_data(symbol: str, market: str = "A") -> dict:
 
 
 # ── 9. 历史数据缓存与快照 ──────────────────────────────────
-HISTORY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history_cache")
+def _data_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+HISTORY_CACHE_DIR = os.path.join(_data_dir(), "history_cache")
 
 
 def _ensure_cache_dir():

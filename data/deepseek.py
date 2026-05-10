@@ -9,12 +9,15 @@ DeepSeek V4 API 客户端封装。
     reply = deepseek_chat("你是技术分析师", "分析贵州茅台的技术面")
     print(reply)
 
-环境变量配置:
+配置（优先级: 环境变量 > config.json > 默认值）:
     DEEPSEEK_BASE_URL    - API 地址，默认 https://api.deepseek.com
     DEEPSEEK_MODEL       - 模型名，默认 deepseek-v4-pro
-    DEEPSEEK_API_KEY     - API Key，从环境变量读取（必需）
+    DEEPSEEK_API_KEY     - API Key
     DEEPSEEK_TEMPERATURE - 温度参数，默认 0.7
-    DEEPSEEK_MAX_TOKENS  - 最大输出 token，默认 4096
+    DEEPSEEK_MAX_TOKENS  - 最大输出 token，默认 8192
+    DEEPSEEK_TIMEOUT     - 请求超时秒数，默认 120
+
+在 GUI「设置」页面可直接配置以上所有参数，保存后自动生效。
 """
 
 import os
@@ -22,13 +25,56 @@ import json
 import requests
 from typing import Optional, Dict, Any
 
-# ── 默认配置（可通过环境变量覆盖） ──────────────────────────
-BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
-API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-TEMPERATURE = float(os.environ.get("DEEPSEEK_TEMPERATURE", "0.7"))
-MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS", "8192"))
-TIMEOUT = int(os.environ.get("DEEPSEEK_TIMEOUT", "120"))
+# ── 默认配置 ──────────────────────────────────────────────
+_DEFAULT_BASE_URL = "https://api.deepseek.com"
+_DEFAULT_MODEL = "deepseek-v4-pro"
+_DEFAULT_TEMPERATURE = 0.7
+_DEFAULT_MAX_TOKENS = 8192
+_DEFAULT_TIMEOUT = 30  # 默认读取超时 30s（连接超时固定 5s）
+
+
+def _load_config_from_file():
+    """从 utils.config 加载配置（优先环境变量，其次 config.json，最后默认值）。"""
+    try:
+        from utils.config import get_config_value
+        return {
+            "base_url": os.environ.get("DEEPSEEK_BASE_URL") or get_config_value("DEEPSEEK_BASE_URL") or _DEFAULT_BASE_URL,
+            "model": os.environ.get("DEEPSEEK_MODEL") or get_config_value("DEEPSEEK_MODEL") or _DEFAULT_MODEL,
+            "api_key": os.environ.get("DEEPSEEK_API_KEY") or get_config_value("DEEPSEEK_API_KEY") or "",
+            "temperature": float(os.environ.get("DEEPSEEK_TEMPERATURE") or get_config_value("DEEPSEEK_TEMPERATURE") or _DEFAULT_TEMPERATURE),
+            "max_tokens": int(os.environ.get("DEEPSEEK_MAX_TOKENS") or get_config_value("DEEPSEEK_MAX_TOKENS") or _DEFAULT_MAX_TOKENS),
+            "timeout": int(os.environ.get("DEEPSEEK_TIMEOUT") or get_config_value("DEEPSEEK_TIMEOUT") or _DEFAULT_TIMEOUT),
+        }
+    except Exception:
+        return {
+            "base_url": os.environ.get("DEEPSEEK_BASE_URL", _DEFAULT_BASE_URL),
+            "model": os.environ.get("DEEPSEEK_MODEL", _DEFAULT_MODEL),
+            "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+            "temperature": float(os.environ.get("DEEPSEEK_TEMPERATURE", str(_DEFAULT_TEMPERATURE))),
+            "max_tokens": int(os.environ.get("DEEPSEEK_MAX_TOKENS", str(_DEFAULT_MAX_TOKENS))),
+            "timeout": int(os.environ.get("DEEPSEEK_TIMEOUT", str(_DEFAULT_TIMEOUT))),
+        }
+
+
+_cfg = _load_config_from_file()
+BASE_URL = _cfg["base_url"]
+MODEL = _cfg["model"]
+API_KEY = _cfg["api_key"]
+TEMPERATURE = _cfg["temperature"]
+MAX_TOKENS = _cfg["max_tokens"]
+TIMEOUT = _cfg["timeout"]
+
+
+def reload_config():
+    """重新加载配置（用户在设置页修改后调用）。"""
+    global BASE_URL, MODEL, API_KEY, TEMPERATURE, MAX_TOKENS, TIMEOUT
+    _cfg = _load_config_from_file()
+    BASE_URL = _cfg["base_url"]
+    MODEL = _cfg["model"]
+    API_KEY = _cfg["api_key"]
+    TEMPERATURE = _cfg["temperature"]
+    MAX_TOKENS = _cfg["max_tokens"]
+    TIMEOUT = _cfg["timeout"]
 
 
 def deepseek_chat(
@@ -90,7 +136,7 @@ def deepseek_chat(
         **extra_body,
     }
 
-    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    resp = requests.post(url, json=payload, headers=headers, timeout=(5, timeout))
     resp.raise_for_status()
     data = resp.json()
 
@@ -143,7 +189,7 @@ def deepseek_chat_stream(
         **extra_body,
     }
 
-    resp = requests.post(url, json=payload, headers=headers, timeout=timeout, stream=True)
+    resp = requests.post(url, json=payload, headers=headers, timeout=(5, timeout), stream=True)
     resp.raise_for_status()
 
     for line in resp.iter_lines():
@@ -198,7 +244,7 @@ if __name__ == '__main__':
     print(f"DeepSeek Client 配置:")
     print(f"  Base URL: {BASE_URL}")
     print(f"  Model:    {MODEL}")
-    print(f"  API Key:  {'已设置' if API_KEY else '未设置（请设置 DEEPSEEK_API_KEY 环境变量）'}")
+    print(f"  API Key:  {'已设置' if API_KEY else '未设置（请在 GUI 设置页或环境变量中配置）'}")
     print(f"  Timeout:  {TIMEOUT}s")
     print()
     print("测试连接...")
