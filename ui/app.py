@@ -178,15 +178,28 @@ class AnalysisWorker(QObject):
                 })
         return genes
 
+    # 共享线程池，避免频繁创建/销毁线程
+    _executor = None
+
+    @classmethod
+    def _get_executor(cls):
+        if cls._executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            cls._executor = ThreadPoolExecutor(max_workers=4)
+        return cls._executor
+
     def _run_with_stdout(self, fn, timeout=120):
-        """通用：重定向 stdout → log_signal, 执行 fn, 发射 result。
-        使用 finally 确保 sys.stdout 始终被恢复。
-        通过 ThreadPoolExecutor 添加超时保护（Windows 兼容）。"""
+        """通用：重定向 stdout → log_signal，执行 fn，发射 result。
+        包含心跳机制防止 Windows 判定程序无响应。"""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, Future
+
         if not _stdout_lock.acquire(blocking=False):
             try:
                 result = fn()
                 self.finished.emit(result)
             except Exception as e:
+                import traceback
+                self.log_signal.emit(f"\n❌ 错误: {e}\n{traceback.format_exc()}")
                 self.error.emit(str(e))
             return
 
@@ -196,19 +209,30 @@ class AnalysisWorker(QObject):
         old = sys.stdout
         captured = WorkerStdout(_emit)
         sys.stdout = captured
+
+        # 心跳线程：每 5 秒发射一次进度信号，防止 Windows 判定无响应
+        heartbeat_running = [True]
+        def _heartbeat():
+            while heartbeat_running[0]:
+                time.sleep(5)
+                if heartbeat_running[0]:
+                    self.progress_signal.emit(0, "分析中...")
+
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
         try:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
             self.progress_signal.emit(10, "加载中...")
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(fn)
-                try:
-                    result = future.result(timeout=timeout)
-                except FuturesTimeoutError:
-                    captured.flush()
-                    self.log_signal.emit(f"\n⏰ 分析超时 ({timeout}s)，已停止等待")
-                    self.progress_signal.emit(0, "超时")
-                    self.error.emit(f"分析超时 ({timeout}s)")
-                    return
+            executor = AnalysisWorker._get_executor()
+            future = executor.submit(fn)
+            try:
+                result = future.result(timeout=timeout)
+            except FuturesTimeoutError:
+                captured.flush()
+                self.log_signal.emit(f"\n⏰ 分析超时 ({timeout}s)，已停止等待")
+                self.progress_signal.emit(0, "超时")
+                self.error.emit(f"分析超时 ({timeout}s)")
+                return
             captured.flush()
             self.progress_signal.emit(100, "完成")
             self.finished.emit(result)
@@ -219,6 +243,7 @@ class AnalysisWorker(QObject):
             self.progress_signal.emit(0, "失败")
             self.error.emit(str(e))
         finally:
+            heartbeat_running[0] = False
             sys.stdout = old
             _stdout_lock.release()
 
@@ -862,6 +887,7 @@ class AnalysisPage(QFrame):
         self._run_worker("executive", sym)
 
     def _run_worker(self, mode: str, symbol: str):
+        self._current_symbol = symbol
         self._thread = QThread()
         self._worker = AnalysisWorker()
         self._worker.moveToThread(self._thread)
@@ -884,21 +910,23 @@ class AnalysisPage(QFrame):
         self._append_output("\n✅ 分析完成！\n")
         self.copy_btn.setEnabled(True)
         self._running = False
+        w = self.window()
+        if hasattr(w, 'save_analysis_log'):
+            w.save_analysis_log(self._current_symbol, self.output_text.toPlainText())
 
     def _on_worker_error(self, msg):
         self.set_loading(False)
         self._append_output(f"\n❌ 分析失败: {msg}\n")
         self.copy_btn.setEnabled(True)
         self._running = False
+        w = self.window()
+        if hasattr(w, 'save_analysis_log'):
+            w.save_analysis_log(self._current_symbol, self.output_text.toPlainText())
 
     def _copy_output(self):
-        w = self.window()
-        if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(self.output_text)
+        self.window().copy_to_clipboard(self.output_text)
         if self.output_text.toPlainText().strip():
             self.copy_btn.setText("✅ 已复制")
-        else:
-            self.copy_btn.setText("⚠ 无内容")
         QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
 
 
@@ -1023,6 +1051,11 @@ class ScreeningPage(QFrame):
         self.progress.setValue(100)
         QTimer.singleShot(500, lambda: self.progress.setVisible(False))
 
+        w = self.window()
+        if hasattr(w, 'save_analysis_log'):
+            scope_label = self.scope_combo.currentText()
+            w.save_analysis_log(f"screen_{scope_label}", self.screen_output_text.toPlainText())
+
         if not stocks:
             self._append("⚠ 未筛选出符合条件的股票\n")
             self._running = False
@@ -1105,16 +1138,15 @@ class ScreeningPage(QFrame):
         self.screen_copy_btn.setEnabled(True)
         self._append(f"\n❌ 选股失败: {msg}\n")
         self._running = False
+        w = self.window()
+        if hasattr(w, 'save_analysis_log'):
+            scope_label = self.scope_combo.currentText()
+            w.save_analysis_log(f"screen_{scope_label}", self.screen_output_text.toPlainText())
 
     def _copy_screen_output(self):
-        """收集选股输出区域所有文本并复制到剪贴板。"""
-        w = self.window()
-        if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(self.screen_output_text)
+        self.window().copy_to_clipboard(self.screen_output_text)
         if self.screen_output_text.toPlainText().strip():
             self.screen_copy_btn.setText("✅ 已复制")
-        else:
-            self.screen_copy_btn.setText("⚠ 无内容")
         QTimer.singleShot(2000, lambda: self.screen_copy_btn.setText("📋 复制报告"))
 
     def _on_table_clicked(self, row, col):
@@ -1232,6 +1264,10 @@ class EvolutionPage(QFrame):
             self.adapt_tab.set_loading(False)
             if result and isinstance(result, dict):
                 self.adapt_tab._show_results(result)
+        w = self.window()
+        if hasattr(w, 'save_analysis_log') and hasattr(current_tab, 'output_text') and hasattr(current_tab, 'symbol_input'):
+            symbol = current_tab.symbol_input.text().strip() or "unknown"
+            w.save_analysis_log(symbol, current_tab.output_text.toPlainText())
 
     def _on_error(self, msg):
         current_tab = self.tabs.currentWidget()
@@ -1243,6 +1279,10 @@ class EvolutionPage(QFrame):
                 current_tab._running = False
         if hasattr(current_tab, 'copy_btn'):
             current_tab.copy_btn.setEnabled(True)
+        w = self.window()
+        if hasattr(w, 'save_analysis_log') and hasattr(current_tab, 'output_text') and hasattr(current_tab, 'symbol_input'):
+            symbol = current_tab.symbol_input.text().strip() or "unknown"
+            w.save_analysis_log(symbol, current_tab.output_text.toPlainText())
 
 
 # ── 子标签1: 回测实验室 ──
@@ -1362,13 +1402,9 @@ class BacktestLabTab(QFrame):
         self._running = False
 
     def _copy_output(self):
-        w = self.window()
-        if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(self.output_text)
+        self.window().copy_to_clipboard(self.output_text)
         if self.output_text.toPlainText().strip():
             self.copy_btn.setText("✅ 已复制")
-        else:
-            self.copy_btn.setText("⚠ 无内容")
         QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
 
 
@@ -1506,17 +1542,10 @@ class AdaptiveMigrationTab(QFrame):
         self._running = False
 
     def _copy_output(self):
-        w = self.window()
-        if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(self.output_text)
+        self.window().copy_to_clipboard(self.output_text)
         if self.output_text.toPlainText().strip():
             self.copy_btn.setText("✅ 已复制")
-        else:
-            self.copy_btn.setText("⚠ 无内容")
         QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
-
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
 
 
 # ── 子标签3: 策略基因库 ──
@@ -2174,6 +2203,10 @@ class MainWindow(QMainWindow):
         self._mail_listener_thread = None
         self._mail_listener_running = False
 
+        # 创建分析日志目录（剪贴板兜底的第一保障）
+        self._analysis_logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis_logs")
+        os.makedirs(self._analysis_logs_dir, exist_ok=True)
+
         # 窗口属性
         self.setWindowTitle("StockMind")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinMaxButtonsHint)
@@ -2491,13 +2524,25 @@ class MainWindow(QMainWindow):
             self.show_and_raise()
 
     def copy_to_clipboard(self, text_widget):
-        """通用复制函数：从 text_widget 提取文本复制到剪贴板，状态栏提示 3 秒。"""
         text = text_widget.toPlainText() if hasattr(text_widget, 'toPlainText') else str(text_widget)
         if text.strip():
-            QApplication.clipboard().setText(text)
-            self._status_bar.showMessage("已复制", 3000)
-        else:
-            self._status_bar.showMessage("无内容可复制", 3000)
+            QApplication.clipboard().setText(text.strip())
+            self._status_bar.showMessage("已复制到剪贴板", 2000)
+
+    def save_analysis_log(self, symbol: str, text: str):
+        """将分析输出写入日志文件（剪贴板兜底的第一保障）。"""
+        if not text or not text.strip():
+            return
+        try:
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{symbol}_{ts}.log"
+            filepath = os.path.join(self._analysis_logs_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(text.strip())
+            self._status_bar.showMessage(f"日志已保存: {filename}", 3000)
+        except Exception as e:
+            self._status_bar.showMessage(f"日志保存失败: {e}", 3000)
 
     def show_and_raise(self):
         """从托盘恢复窗口，优先使用 Windows API 确保可靠显示。"""

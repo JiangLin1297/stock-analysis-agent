@@ -55,18 +55,21 @@ def retry(max_attempts=3, base_delay=1.5):
     return deco
 
 
-def run_with_timeout(func, timeout_sec=10, *args, **kwargs):
+# 共享线程池，限制并发请求数在 4 以内，防止瞬间爆栈
+_SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+
+
+def run_with_timeout(func, timeout_sec=20, *args, **kwargs):
     """在线程池中运行 func，超时则返回 None 并打印警告。"""
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(func, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout_sec)
-        except FuturesTimeoutError:
-            print(f"  ⚠ {func.__name__} 超时 ({timeout_sec}s)，跳过此数据源")
-            return None
-        except Exception as e:
-            print(f"  ⚠ {func.__name__} 异常: {e}")
-            return None
+    future = _SHARED_EXECUTOR.submit(func, *args, **kwargs)
+    try:
+        return future.result(timeout=timeout_sec)
+    except FuturesTimeoutError:
+        print(f"  ⚠ {func.__name__} 超时 ({timeout_sec}s)，跳过此数据源")
+        return None
+    except Exception as e:
+        print(f"  ⚠ {func.__name__} 异常: {e}")
+        return None
 
 
 def normalize_symbol(symbol):

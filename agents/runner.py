@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 
 from agents.prompts import AGENT_PROMPTS
-from data.deepseek import deepseek_chat
+from data.deepseek import DeepSeekClient
 from utils.format import (card_header, card_line, card_empty, card_bottom, card_field,
                           card_dual, section_div, thin_sep, table_header, table_row,
                           table_sep, format_signal, format_pct, format_price, CARD_W)
@@ -296,7 +296,7 @@ def _call_llm_agent(agent_name: str, system_prompt: str, context_text: str,
 
     prompt_filled = system_prompt.replace("{{context}}", context_text)
     try:
-        raw = deepseek_chat(prompt_filled, "请输出JSON分析结果。")
+        raw = DeepSeekClient().chat(prompt_filled, "请输出JSON分析结果。")
         return _parse_agent_json(raw, agent_name)
     except Exception as e:
         print(f"  [WARN] {agent_name} API调用失败: {e}，回退到本地推断")
@@ -962,7 +962,7 @@ def extract_news_sentiment(compressed_data: dict, use_mock: bool = True) -> dict
     from agents.prompts import NEWS_SENTIMENT_PROMPT
     ctx = format_sentiment_context(compressed_data)
     try:
-        raw = deepseek_chat(NEWS_SENTIMENT_PROMPT, ctx, max_tokens=512, timeout=30)
+        raw = DeepSeekClient().chat(NEWS_SENTIMENT_PROMPT, ctx, max_tokens=512, timeout=30)
         result = _parse_agent_json(raw, "news_sentiment")
         sentiment_score = max(-5, min(5, int(result.get("sentiment_score", 0))))
         impact_score = max(0, min(10, int(result.get("impact_score", 5))))
@@ -1031,7 +1031,7 @@ def extract_qualitative_factors(compressed_data: dict, use_mock: bool = True) ->
     from agents.prompts import QUALITATIVE_PROMPT
     ctx = format_fundamental_context(compressed_data)
     try:
-        raw = deepseek_chat(QUALITATIVE_PROMPT, ctx, max_tokens=512, timeout=30)
+        raw = DeepSeekClient().chat(QUALITATIVE_PROMPT, ctx, max_tokens=512, timeout=30)
         result = _parse_agent_json(raw, "qualitative")
         return {
             "moat_score": max(0, min(10, int(result.get("moat_score", 5)))),
