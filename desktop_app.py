@@ -2,12 +2,19 @@
 """
 StockMind Desktop Launcher
 带崩溃保护、托盘优先启动、异步初始化的桌面入口。
+
+启动顺序:
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    window = MainWindow()          # 先创建窗口
+    window.setup_tray()            # 创建托盘(动态绘制图标)
+    window.show()
+    sys.exit(app.exec())
 """
 
 import sys
 import os
 import traceback
-import atexit
 from datetime import datetime
 
 # 确保项目根目录在路径中
@@ -31,7 +38,6 @@ def _global_exception_hook(exc_type, exc_value, exc_tb):
     except Exception:
         pass
 
-    # 尝试弹窗
     try:
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.critical(
@@ -61,7 +67,7 @@ def main():
         if v and not os.environ.get(k):
             os.environ[k] = str(v)
 
-    # ── 4. 创建 QApplication（关键：托盘不退出）──
+    # ── 4. QApplication ──
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QFont
 
@@ -70,61 +76,23 @@ def main():
     app.setOrganizationName("StockMind")
     app.setQuitOnLastWindowClosed(False)
 
-    # 全局字体
     font = QFont("Microsoft YaHei", 9)
     font.setStyleStrategy(QFont.PreferAntialias)
     app.setFont(font)
 
-    # ── 5. 先创建托盘图标（含临时 QMenu），再显示主窗口 ──
-    from PySide6.QtWidgets import QSystemTrayIcon, QMenu
-    from PySide6.QtGui import QAction
-
-    tray = QSystemTrayIcon()
-    tray.setToolTip("StockMind")
-
-    # 托盘菜单
-    tray_menu = QMenu()
-    show_action = QAction("显示主窗口")
-    quit_action = QAction("退出")
-    tray_menu.addAction(show_action)
-    tray_menu.addSeparator()
-    tray_menu.addAction(quit_action)
-    tray.setContextMenu(tray_menu)
-    tray.show()
-
-    # ── 6. 异步创建主窗口（让托盘先就位）──
-    from PySide6.QtCore import QTimer
+    # ── 5. 先创建窗口，再创建托盘（传入窗口引用）──
     from ui.app import MainWindow
 
-    window = None
+    window = MainWindow()
+    window.setup_tray()          # 内部用 QPainter 动态绘制 32x32 托盘图标
+    window.show()
 
-    def _create_window():
-        nonlocal window
-        try:
-            window = MainWindow()
-            window._tray_icon = tray
-            show_action.triggered.connect(window.show_and_raise)
-            quit_action.triggered.connect(window.quit_app)
-            tray.activated.connect(
-                lambda reason: window.show_and_raise()
-                if reason == QSystemTrayIcon.DoubleClick else None
-            )
-            window.show()
-        except Exception as e:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.critical(None, "启动失败", f"主窗口创建失败:\n{e}")
-            _global_exception_hook(type(e), e, e.__traceback__)
-            app.quit()
-
-    QTimer.singleShot(100, _create_window)
-
-    # ── 7. 事件循环 ──
+    # ── 6. 事件循环 ──
     exit_code = app.exec()
 
-    # ── 8. 清理 ──
-    if window and hasattr(window, '_scheduler') and window._scheduler:
+    # ── 7. 清理 ──
+    if hasattr(window, '_scheduler') and window._scheduler:
         window._scheduler.running = False
-    tray.hide()
 
     sys.exit(exit_code)
 

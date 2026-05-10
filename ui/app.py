@@ -178,11 +178,11 @@ class AnalysisWorker(QObject):
                 })
         return genes
 
-    def _run_with_stdout(self, fn):
+    def _run_with_stdout(self, fn, timeout=120):
         """通用：重定向 stdout → log_signal, 执行 fn, 发射 result。
-        使用 finally 确保 sys.stdout 始终被恢复。"""
+        使用 finally 确保 sys.stdout 始终被恢复。
+        通过 ThreadPoolExecutor 添加超时保护（Windows 兼容）。"""
         if not _stdout_lock.acquire(blocking=False):
-            # 已有其他 worker 在捕获 stdout，直接执行不捕获
             try:
                 result = fn()
                 self.finished.emit(result)
@@ -197,8 +197,18 @@ class AnalysisWorker(QObject):
         captured = WorkerStdout(_emit)
         sys.stdout = captured
         try:
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
             self.progress_signal.emit(10, "加载中...")
-            result = fn()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(fn)
+                try:
+                    result = future.result(timeout=timeout)
+                except FuturesTimeoutError:
+                    captured.flush()
+                    self.log_signal.emit(f"\n⏰ 分析超时 ({timeout}s)，已停止等待")
+                    self.progress_signal.emit(0, "超时")
+                    self.error.emit(f"分析超时 ({timeout}s)")
+                    return
             captured.flush()
             self.progress_signal.emit(100, "完成")
             self.finished.emit(result)
@@ -882,17 +892,14 @@ class AnalysisPage(QFrame):
         self._running = False
 
     def _copy_output(self):
-        text = self.output_text.toPlainText()
-        if text.strip():
-            QApplication.clipboard().setText(text)
-            self.copy_btn.setText("✅ 已复制")
-            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
-        else:
-            self.copy_btn.setText("⚠ 无内容")
-            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
         w = self.window()
         if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(text)
+            w.copy_to_clipboard(self.output_text)
+        if self.output_text.toPlainText().strip():
+            self.copy_btn.setText("✅ 已复制")
+        else:
+            self.copy_btn.setText("⚠ 无内容")
+        QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1101,17 +1108,14 @@ class ScreeningPage(QFrame):
 
     def _copy_screen_output(self):
         """收集选股输出区域所有文本并复制到剪贴板。"""
-        text = self.screen_output_text.toPlainText()
-        if text.strip():
-            QApplication.clipboard().setText(text)
-            self.screen_copy_btn.setText("✅ 已复制")
-            QTimer.singleShot(2000, lambda: self.screen_copy_btn.setText("📋 复制报告"))
-        else:
-            self.screen_copy_btn.setText("⚠ 无内容")
-            QTimer.singleShot(2000, lambda: self.screen_copy_btn.setText("📋 复制报告"))
         w = self.window()
         if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(text)
+            w.copy_to_clipboard(self.screen_output_text)
+        if self.screen_output_text.toPlainText().strip():
+            self.screen_copy_btn.setText("✅ 已复制")
+        else:
+            self.screen_copy_btn.setText("⚠ 无内容")
+        QTimer.singleShot(2000, lambda: self.screen_copy_btn.setText("📋 复制报告"))
 
     def _on_table_clicked(self, row, col):
         if not hasattr(self, 'results_table') or not self.results_table:
@@ -1358,17 +1362,14 @@ class BacktestLabTab(QFrame):
         self._running = False
 
     def _copy_output(self):
-        text = self.output_text.toPlainText()
-        if text.strip():
-            QApplication.clipboard().setText(text)
-            self.copy_btn.setText("✅ 已复制")
-            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
-        else:
-            self.copy_btn.setText("⚠ 无内容")
-            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
         w = self.window()
         if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(text)
+            w.copy_to_clipboard(self.output_text)
+        if self.output_text.toPlainText().strip():
+            self.copy_btn.setText("✅ 已复制")
+        else:
+            self.copy_btn.setText("⚠ 无内容")
+        QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
 
 
 # ── 子标签2: 自适应迁移 ──
@@ -1505,17 +1506,14 @@ class AdaptiveMigrationTab(QFrame):
         self._running = False
 
     def _copy_output(self):
-        text = self.output_text.toPlainText()
-        if text.strip():
-            QApplication.clipboard().setText(text)
-            self.copy_btn.setText("✅ 已复制")
-            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
-        else:
-            self.copy_btn.setText("⚠ 无内容")
-            QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
         w = self.window()
         if w and hasattr(w, 'copy_to_clipboard'):
-            w.copy_to_clipboard(text)
+            w.copy_to_clipboard(self.output_text)
+        if self.output_text.toPlainText().strip():
+            self.copy_btn.setText("✅ 已复制")
+        else:
+            self.copy_btn.setText("⚠ 无内容")
+        QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 复制报告"))
 
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
@@ -2492,15 +2490,14 @@ class MainWindow(QMainWindow):
         if reason == QSystemTrayIcon.DoubleClick:
             self.show_and_raise()
 
-    def copy_to_clipboard(self, text: str):
-        """通用复制函数：复制文本到剪贴板并在状态栏提示 3 秒。"""
-        if not text or not text.strip():
-            self._status_bar.showMessage("⚠ 无内容可复制")
-            QTimer.singleShot(3000, lambda: self._status_bar.showMessage("就绪"))
-            return
-        QApplication.clipboard().setText(text)
-        self._status_bar.showMessage("✅ 已复制到剪贴板")
-        QTimer.singleShot(3000, lambda: self._status_bar.showMessage("就绪"))
+    def copy_to_clipboard(self, text_widget):
+        """通用复制函数：从 text_widget 提取文本复制到剪贴板，状态栏提示 3 秒。"""
+        text = text_widget.toPlainText() if hasattr(text_widget, 'toPlainText') else str(text_widget)
+        if text.strip():
+            QApplication.clipboard().setText(text)
+            self._status_bar.showMessage("已复制", 3000)
+        else:
+            self._status_bar.showMessage("无内容可复制", 3000)
 
     def show_and_raise(self):
         """从托盘恢复窗口，优先使用 Windows API 确保可靠显示。"""
