@@ -204,7 +204,7 @@ def _run_analysis_thread(symbol, use_mock, use_portfolio):
             st.session_state["_news_status"] = "无数据"
     except Exception as e:
         st.session_state["_analysis_result"] = None
-        st.session_state["_analysis_error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        st.session_state["_analysis_error"] = f"{type(e).__name__}: {e}"
         st.session_state["_news_status"] = "未获取"
     finally:
         sys.stdout = old_stdout
@@ -619,63 +619,62 @@ elif current_page == "智能选股":
         progress_bar = st.progress(0, text="准备中...")
         log_placeholder = st.empty()
 
+        from analysis.screener import screen_stocks
+
+        output_lines = []
+        capture_lock = threading.Lock()
+        capture = _LiveCapture(output_lines, capture_lock)
+        old_stdout = sys.stdout
         try:
-            from analysis.screener import screen_stocks
-
-            output_lines = []
-            capture_lock = threading.Lock()
-            capture = _LiveCapture(output_lines, capture_lock)
-            old_stdout = sys.stdout
             sys.stdout = capture
-
             results = screen_stocks(scope=scope, top_n=top_n, use_mock=use_mock_sc)
-            sys.stdout = old_stdout
-
-            progress_bar.progress(1.0, text="选股完成")
-            log_placeholder.code("".join(output_lines), language=None)
-
-            if not results:
-                st.warning("未筛选出符合条件的股票")
-                st.stop()
-
-            st.session_state.screen_results = results
-            st.session_state.screen_scope = scope
-            st.success(f"共筛选出 {len(results)} 只股票")
-
-            import pandas as pd
-            rows = []
-            for i, stock in enumerate(results):
-                quote = stock.get("quote", {})
-                technical = stock.get("technical", {})
-                rows.append({
-                    "排名": i + 1,
-                    "代码": stock.get("symbol", "?"),
-                    "名称": stock.get("name", ""),
-                    "评分": stock.get("score", 0),
-                    "现价": quote.get("price") or technical.get("close", "N/A"),
-                    "涨跌%": quote.get("change_pct", 0),
-                    "PE": quote.get("pe", "N/A"),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.caption("点击跳转到深度分析")
-            cols = st.columns(min(len(results), 6))
-            for i, stock in enumerate(results[:12]):
-                sym = stock.get("symbol", "?")
-                name = stock.get("name", sym)
-                score = stock.get("score", 0)
-                with cols[i % 6]:
-                    if st.button(f"{sym} {name} ⭐{score}", key=f"goto_{sym}", use_container_width=True):
-                        st.session_state.deep_symbol = sym
-                        st.session_state.page = "深度分析"
-                        st.rerun()
-
         except Exception as e:
-            sys.stdout = old_stdout if 'old_stdout' in dir() else sys.stdout
             progress_bar.progress(1.0, text="选股失败")
             st.error(f"选股过程出错: {e}")
             st.code(traceback.format_exc())
+            st.stop()
+        finally:
+            sys.stdout = old_stdout
+
+        progress_bar.progress(1.0, text="选股完成")
+        log_placeholder.code("".join(output_lines), language=None)
+
+        if not results:
+            st.warning("未筛选出符合条件的股票")
+            st.stop()
+
+        st.session_state.screen_results = results
+        st.session_state.screen_scope = scope
+        st.success(f"共筛选出 {len(results)} 只股票")
+
+        import pandas as pd
+        rows = []
+        for i, stock in enumerate(results):
+            quote = stock.get("quote", {})
+            technical = stock.get("technical", {})
+            rows.append({
+                "排名": i + 1,
+                "代码": stock.get("symbol", "?"),
+                "名称": stock.get("name", ""),
+                "评分": stock.get("score", 0),
+                "现价": quote.get("price") or technical.get("close", "N/A"),
+                "涨跌%": quote.get("change_pct", 0),
+                "PE": quote.get("pe", "N/A"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.caption("点击跳转到深度分析")
+        cols = st.columns(min(len(results), 6))
+        for i, stock in enumerate(results[:12]):
+            sym = stock.get("symbol", "?")
+            name = stock.get("name", sym)
+            score = stock.get("score", 0)
+            with cols[i % 6]:
+                if st.button(f"{sym} {name} ⭐{score}", key=f"goto_{sym}", use_container_width=True):
+                    st.session_state.deep_symbol = sym
+                    st.session_state.page = "深度分析"
+                    st.rerun()
 
     elif st.session_state.screen_results:
         st.divider()
@@ -721,15 +720,14 @@ elif current_page == "回测实验室":
         st.divider()
         round_placeholders = [st.empty() for _ in range(int(bt_rounds))]
 
+        from backtest.runner import run_backtest_with_critic
+
+        output_lines = []
+        capture_lock = threading.Lock()
+        capture = _LiveCapture(output_lines, capture_lock)
+        old_stdout = sys.stdout
         try:
-            from backtest.runner import run_backtest_with_critic
-
-            output_lines = []
-            capture_lock = threading.Lock()
-            capture = _LiveCapture(output_lines, capture_lock)
-            old_stdout = sys.stdout
             sys.stdout = capture
-
             result = run_backtest_with_critic(
                 symbol=bt_symbol.strip(),
                 time_frame=bt_timeframe,
@@ -738,46 +736,46 @@ elif current_page == "回测实验室":
                 initial_capital=float(bt_capital),
                 use_mock=bt_mock,
             )
-            sys.stdout = old_stdout
-
-            st.session_state.backtest_result = result
-
-            with st.expander("📋 回测日志", expanded=False):
-                st.code("".join(output_lines[-8000:]), language=None)
-
-            rounds = result.get("rounds", [])
-            for i, rd in enumerate(rounds):
-                if i < len(round_placeholders):
-                    m = rd.get("backtest_metrics", {})
-                    score = rd.get("critic_score", 0)
-                    with round_placeholders[i].container():
-                        st.subheader(f"第 {rd.get('round', i+1)} 轮")
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("总收益", f"{m.get('total_return_pct', 0):+.2f}%")
-                        c2.metric("夏普比率", f"{m.get('sharpe_ratio', 0):.2f}")
-                        c3.metric("胜率", f"{m.get('win_rate_pct', 0):.1f}%")
-                        c4.metric("Critic评分", f"{score:.1f}/100")
-                        dd = m.get("max_drawdown_pct", 0)
-                        ach_s = m.get("achievement_short", 0)
-                        ach_m = m.get("achievement_mid", 0)
-                        ach_l = m.get("achievement_long", 0)
-                        st.caption(f"最大回撤: {dd:.2f}% | 三线达成率: 短{ach_s:.0f}% 中{ach_m:.0f}% 长{ach_l:.0f}%")
-                        must_fix = rd.get("must_fix", [])
-                        if must_fix:
-                            with st.expander(f"Critic优化建议 ({len(must_fix)}条)", expanded=False):
-                                for fix in must_fix:
-                                    st.caption(f"• {fix}")
-
-            st.divider()
-            final_score = result.get("final_score", 0)
-            improvement = result.get("improvement", 0)
-            st.metric("最终评分", f"{final_score:.1f}/100",
-                      delta=f"{improvement:+.1f}" if improvement else None)
-
         except Exception as e:
-            sys.stdout = old_stdout if 'old_stdout' in dir() else sys.stdout
             st.error(f"回测过程出错: {e}")
             st.code(traceback.format_exc())
+            st.stop()
+        finally:
+            sys.stdout = old_stdout
+
+        st.session_state.backtest_result = result
+
+        with st.expander("📋 回测日志", expanded=False):
+            st.code("".join(output_lines[-8000:]), language=None)
+
+        rounds = result.get("rounds", [])
+        for i, rd in enumerate(rounds):
+            if i < len(round_placeholders):
+                m = rd.get("backtest_metrics", {})
+                score = rd.get("critic_score", 0)
+                with round_placeholders[i].container():
+                    st.subheader(f"第 {rd.get('round', i+1)} 轮")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("总收益", f"{m.get('total_return_pct', 0):+.2f}%")
+                    c2.metric("夏普比率", f"{m.get('sharpe_ratio', 0):.2f}")
+                    c3.metric("胜率", f"{m.get('win_rate_pct', 0):.1f}%")
+                    c4.metric("Critic评分", f"{score:.1f}/100")
+                    dd = m.get("max_drawdown_pct", 0)
+                    ach_s = m.get("achievement_short", 0)
+                    ach_m = m.get("achievement_mid", 0)
+                    ach_l = m.get("achievement_long", 0)
+                    st.caption(f"最大回撤: {dd:.2f}% | 三线达成率: 短{ach_s:.0f}% 中{ach_m:.0f}% 长{ach_l:.0f}%")
+                    must_fix = rd.get("must_fix", [])
+                    if must_fix:
+                        with st.expander(f"Critic优化建议 ({len(must_fix)}条)", expanded=False):
+                            for fix in must_fix:
+                                st.caption(f"• {fix}")
+
+        st.divider()
+        final_score = result.get("final_score", 0)
+        improvement = result.get("improvement", 0)
+        st.metric("最终评分", f"{final_score:.1f}/100",
+                  delta=f"{improvement:+.1f}" if improvement else None)
 
     elif st.session_state.backtest_result:
         st.divider()

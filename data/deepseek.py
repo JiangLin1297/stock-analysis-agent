@@ -36,7 +36,7 @@ _DEFAULT_MAX_TOKENS = 8192
 _DEFAULT_TIMEOUT = 30
 _DEFAULT_CONNECT_TIMEOUT = 8
 _MAX_RETRIES = 2
-_RETRY_BACKOFF = [2, 4]  # 指数退避秒数
+_RETRY_BACKOFF_BASE = 2  # 指数退避基数（2, 4, 8, 16...）
 
 
 def _load_config_from_file():
@@ -172,7 +172,10 @@ class DeepSeekClient:
                 resp = requests.post(url, json=payload, headers=headers, timeout=(connect_to, read_to))
                 resp.raise_for_status()
                 data = resp.json()
-                msg = data["choices"][0]["message"]
+                choices = data.get("choices", [])
+                if not choices:
+                    raise ValueError(f"API 返回无 choices: {data}")
+                msg = choices[0].get("message", {})
                 content = msg.get("content", "")
                 if not content:
                     content = msg.get("reasoning_content", "")
@@ -181,7 +184,7 @@ class DeepSeekClient:
                     requests.exceptions.ConnectionError) as e:
                 last_error = e
                 if attempt < _MAX_RETRIES:
-                    wait = _RETRY_BACKOFF[attempt]
+                    wait = _RETRY_BACKOFF_BASE ** (attempt + 1)
                     import time as _time
                     _time.sleep(wait)
             except Exception as e:
@@ -234,22 +237,25 @@ class DeepSeekClient:
         }
 
         resp = requests.post(url, json=payload, headers=headers, timeout=(5, timeout), stream=True)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
 
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            line = line.decode('utf-8')
-            if line.startswith('data: '):
-                chunk = line[6:]
-                if chunk == '[DONE]':
-                    break
-                try:
-                    delta = json.loads(chunk)['choices'][0].get('delta', {})
-                    if 'content' in delta:
-                        yield delta['content']
-                except (json.JSONDecodeError, KeyError, IndexError):
+            for line in resp.iter_lines():
+                if not line:
                     continue
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    chunk = line[6:]
+                    if chunk == '[DONE]':
+                        break
+                    try:
+                        delta = json.loads(chunk)['choices'][0].get('delta', {})
+                        if 'content' in delta:
+                            yield delta['content']
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+        finally:
+            resp.close()
 
 
 # ═══════════════════════════════════════════════════════════════

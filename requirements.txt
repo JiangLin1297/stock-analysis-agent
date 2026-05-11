@@ -5,3 +5,5 @@ stockstats>=0.5.3
 akshare>=1.12.0
 PySide6>=6.5.0
 pywin32>=305
+streamlit>=1.28.0
+certifi>=2023.7.22

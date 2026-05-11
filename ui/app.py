@@ -199,13 +199,9 @@ class AnalysisWorker(QObject):
         from concurrent.futures import TimeoutError as FuturesTimeoutError
         import traceback as _tb, re as _re
 
-        # ── 逐行追踪日志 ──
+        # ── 逐行追踪日志（调试时可启用） ──
         def _trace(msg: str):
-            try:
-                with open("analysis_trace.log", "a", encoding="utf-8") as _f:
-                    _f.write(f"[{time.time():.3f}] {msg}\n")
-            except Exception:
-                pass
+            pass
 
         _trace("Worker _run_with_stdout entered")
 
@@ -968,33 +964,18 @@ class AnalysisPage(QFrame):
             self.progress.setValue(100)
 
     def start_analysis(self):
-        with open("button_click.log", "a") as f:
-            f.write(f"\n=== start_analysis called at {datetime.now().isoformat()} ===\n")
         try:
             sym = self.symbol_input.text().strip()
-            with open("button_click.log", "a") as f:
-                f.write(f"Symbol: '{sym}'\n")
             if not sym:
                 QMessageBox.warning(self, "提示", "请输入股票代码")
                 return
-            with open("button_click.log", "a") as f:
-                f.write("Calling _clear_output...\n")
             self._clear_output()
-            with open("button_click.log", "a") as f:
-                f.write("Calling _append_output...\n")
             self._append_output(f"🚀 开始深度分析: {sym}\n")
-            with open("button_click.log", "a") as f:
-                f.write("Calling set_loading(True)...\n")
             self.set_loading(True)
-            with open("button_click.log", "a") as f:
-                f.write("Calling _run_worker...\n")
             self._run_worker("deep", sym)
-            with open("button_click.log", "a") as f:
-                f.write("_run_worker returned OK\n")
         except Exception as e:
-            import traceback as _tb
-            with open("button_click.log", "a") as f:
-                f.write(f"EXCEPTION in start_analysis: {e}\n{_tb.format_exc()}\n")
+            self._append_output(f"❌ 启动分析失败: {e}\n")
+            self.set_loading(False)
             raise
 
     def start_executive(self):
@@ -1008,64 +989,29 @@ class AnalysisPage(QFrame):
         self._run_worker("executive", sym)
 
     def _run_worker(self, mode: str, symbol: str):
-        with open("button_click.log", "a") as f:
-            f.write(f"_run_worker: mode={mode} symbol={symbol}\n")
         try:
             self._current_symbol = symbol
-            with open("button_click.log", "a") as f:
-                f.write("  Creating QThread...\n")
             self._thread = QThread()
-            with open("button_click.log", "a") as f:
-                f.write(f"  QThread created: {self._thread}\n")
-            with open("button_click.log", "a") as f:
-                f.write("  Creating AnalysisWorker...\n")
             self._worker = AnalysisWorker()
-            with open("button_click.log", "a") as f:
-                f.write(f"  AnalysisWorker created: {self._worker}\n")
-            with open("button_click.log", "a") as f:
-                f.write("  Calling moveToThread...\n")
             self._worker.moveToThread(self._thread)
-            with open("button_click.log", "a") as f:
-                f.write("  moveToThread OK\n")
 
             if mode == "deep":
                 use_pf = self.portfolio_cb.isChecked()
                 use_ap = self.adaptive_cb.isChecked()
-                with open("button_click.log", "a") as f:
-                    f.write(f"  Connecting started signal (deep: pf={use_pf} ap={use_ap})...\n")
                 self._thread.started.connect(lambda: self._worker.run_deep_analysis(symbol, use_pf, use_ap))
             else:
-                with open("button_click.log", "a") as f:
-                    f.write("  Connecting started signal (executive)...\n")
                 self._thread.started.connect(lambda: self._worker.run_executive(symbol))
 
-            with open("button_click.log", "a") as f:
-                f.write("  Connecting log_signal...\n")
             self._worker.log_signal.connect(self._append_output)
-            with open("button_click.log", "a") as f:
-                f.write("  Connecting chunk_signal...\n")
             self._worker.chunk_signal.connect(self._on_chunk)
-            with open("button_click.log", "a") as f:
-                f.write("  Connecting phase_signal...\n")
             self._worker.phase_signal.connect(self._on_phase)
-            with open("button_click.log", "a") as f:
-                f.write("  Connecting finished...\n")
             self._worker.finished.connect(self._on_worker_finished)
-            with open("button_click.log", "a") as f:
-                f.write("  Connecting error...\n")
             self._worker.error.connect(self._on_worker_error)
-            with open("button_click.log", "a") as f:
-                f.write("  Connecting finished -> deleteLater...\n")
             self._thread.finished.connect(self._thread.deleteLater)
-            with open("button_click.log", "a") as f:
-                f.write("  Calling thread.start()...\n")
             self._thread.start()
-            with open("button_click.log", "a") as f:
-                f.write("  thread.start() returned OK\n")
         except Exception as e:
-            import traceback as _tb2
-            with open("button_click.log", "a") as f:
-                f.write(f"  EXCEPTION in _run_worker: {e}\n{_tb2.format_exc()}\n")
+            self._append_output(f"❌ 启动工作线程失败: {e}\n")
+            self.set_loading(False)
             raise
 
     def _on_worker_finished(self, result):

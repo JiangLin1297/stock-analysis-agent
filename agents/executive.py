@@ -169,7 +169,12 @@ def executive_decision(symbol: str, market: str = "A", use_mock: bool = False) -
                                  macro_risk=macro_risk)
     else:
         print("[执行总裁] 正在调用 DeepSeek 综合决策...")
-        raw = deepseek_chat(EXECUTIVE_AGENT_PROMPT, full_context, temperature=0.3, max_tokens=1024)
+        try:
+            raw = deepseek_chat(EXECUTIVE_AGENT_PROMPT, full_context, temperature=0.3, max_tokens=1024)
+        except Exception as e:
+            print(f"[执行总裁] LLM 调用失败: {e}, 回退到 Mock 模式")
+            return _mock_executive(symbol, analysis, pf, ps, held_position, current_price,
+                                   macro_risk=macro_risk)
         result = _parse_json(raw)
 
     # 7. 硬规则兜底（注入宏观风控结果）

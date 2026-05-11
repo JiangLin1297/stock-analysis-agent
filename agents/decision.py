@@ -124,14 +124,22 @@ def make_decision(compressed_data: dict, agent_reports: list[dict], debate_resul
     # 使用三线合成决策 Prompt
     prompt_3d = ALL_PROMPTS.get("synthesis_3d_agent",
         ALL_PROMPTS.get("synthesis_agent", "")).replace("{{context}}", ctx)
-    raw = deepseek_chat(prompt_3d, "请输出三个时间维度的交易决策JSON。")
+    try:
+        raw = deepseek_chat(prompt_3d, "请输出三个时间维度的交易决策JSON。")
+    except Exception as e:
+        print(f"[Decision] LLM 调用失败: {e}, 使用 Mock 决策")
+        return _mock_decision_3d(compressed_data, agent_reports, debate_result, time_frame_opinions, adapted_params)
     decision_3d = _parse_json(raw)
 
     # 兜底：如果LLM输出结构不对，回退到原始决策格式
     if "short_term" not in decision_3d and "action" not in decision_3d:
         # 尝试使用旧的 synthesis_agent
         old_prompt = ALL_PROMPTS["synthesis_agent"].replace("{{context}}", ctx)
-        raw = deepseek_chat(old_prompt, "请输出交易决策JSON。")
+        try:
+            raw = deepseek_chat(old_prompt, "请输出交易决策JSON。")
+        except Exception as e:
+            print(f"[Decision] 兜底 LLM 调用失败: {e}, 使用 Mock 决策")
+            return _mock_decision_3d(compressed_data, agent_reports, debate_result, time_frame_opinions, adapted_params)
         old_decision = _parse_json(raw)
         decision_3d = _convert_to_3d(old_decision, time_frame_opinions)
 
@@ -761,6 +769,7 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
 
         print(f"\n{section_div(' PORTFOLIO DIAGNOSIS ')}")
 
+        exit_advices = []
         for held in pf.get("positions", []):
             held_sym = held["symbol"]
             held_entry = held["entry_price"]
@@ -891,7 +900,13 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
     # ── 风险自适应 ──
     risk_state = None
     try:
-        risk_state = get_risk_state()
+        from portfolio.manager import load_portfolio as _lp
+        _pf = _lp(refresh=False)
+        _total = _pf.get("total_assets", 0)
+        _init = _pf.get("initial_capital", _total) or _total
+        _dd = round((_init - _total) / _init * 100, 2) if _init > 0 else 0
+        _losses = sum(1 for t in _pf.get("trade_log", [])[-10:] if t.get("pnl", 0) < 0)
+        risk_state = {"drawdown_pct": _dd, "consecutive_losses": _losses}
     except Exception:
         pass
 

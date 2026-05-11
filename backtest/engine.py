@@ -153,6 +153,9 @@ def run_backtest(symbol: str, start_date, end_date,
     max_dd_so_far = 0.0
     peak_equity = initial_capital
 
+    # 预建日期索引，避免循环内 O(n) 全表扫描
+    _date_groups = {date: group for date, group in df_full.groupby('date')}
+
     print(f"\n{'='*70}")
     print(f"  回测开始: {symbol} {start_date} → {end_date} ({len(trading_days)} 交易日)")
     print(f"  初始资金: ¥{initial_capital:,.0f}")
@@ -161,7 +164,7 @@ def run_backtest(symbol: str, start_date, end_date,
     # ── 逐日推进 ──
     for day_idx, trade_date in enumerate(trading_days):
         if day_idx < 20:  # 前20天用于预热指标
-            price_row = df_full[df_full['date'] == trade_date]
+            price_row = _date_groups.get(trade_date, pd.DataFrame())
             if not price_row.empty:
                 current_price = float(price_row['close'].iloc[0])
                 equity_curve.append({
@@ -421,7 +424,8 @@ def run_backtest(symbol: str, start_date, end_date,
     for tf_key in ["short_term", "mid_term", "long_term"]:
         pos = positions[tf_key]
         if pos is not None:
-            final_price = float(df_full[df_full['date'] == final_date]['close'].iloc[0]) if len(df_full[df_full['date'] == final_date]) > 0 else current_price
+            final_group = _date_groups.get(final_date, pd.DataFrame())
+            final_price = float(final_group['close'].iloc[0]) if not final_group.empty else current_price
             sell_value = pos["quantity"] * final_price
             commission = sell_value * COMMISSION_RATE
             stamp = sell_value * STAMP_TAX_RATE

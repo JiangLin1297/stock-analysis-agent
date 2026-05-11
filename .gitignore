@@ -26,6 +26,8 @@ factor_weights.json.bak
 evolution_log.txt
 backtest_evolution_log.txt
 mail_command_log.txt
+crash_log.txt
+fatal_signal.log
 
 # ── 缓存数据 ─────────────────────────────────────────
 history_cache/

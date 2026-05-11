@@ -13,22 +13,37 @@ def _data_dir() -> str:
 
 CONFIG_FILE = os.path.join(_data_dir(), "config.json")
 
+# ── 配置缓存（基于文件修改时间） ──────────────────────────
+_config_cache = None
+_config_mtime = 0.0
+
 
 def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    global _config_cache, _config_mtime
+    try:
+        mtime = os.path.getmtime(CONFIG_FILE)
+        if _config_cache is not None and mtime == _config_mtime:
+            return _config_cache
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            _config_cache = json.load(f)
+        _config_mtime = mtime
+        return _config_cache
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
 
 
 def save_config(data: dict) -> None:
+    global _config_cache, _config_mtime
     existing = load_config()
     existing.update(data)
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(existing, f, ensure_ascii=False, indent=2)
+    # 写入后更新缓存
+    _config_cache = existing
+    try:
+        _config_mtime = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        _config_mtime = 0.0
 
 
 def get_config_value(key: str, default: str = "") -> str:

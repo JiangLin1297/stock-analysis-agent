@@ -64,8 +64,13 @@ def _ensure_file():
 def load_portfolio(refresh: bool = True) -> dict:
     """从 portfolio.json 加载持仓和总资产。refresh=True 时自动更新市值（有5分钟冷却）。"""
     _ensure_file()
-    with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
-        pf = json.load(f)
+    try:
+        with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
+            pf = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[Portfolio] portfolio.json 损坏，重建默认: {e}")
+        save_portfolio(DEFAULT_PORTFOLIO)
+        return DEFAULT_PORTFOLIO.copy()
     if refresh and pf.get("positions") and _needs_refresh(pf):
         try:
             pf = update_market_values(pf)
