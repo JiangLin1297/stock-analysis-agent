@@ -289,3 +289,76 @@ def update_market_values(pf: dict = None) -> dict:
     save_portfolio(pf)
 
     return pf
+
+
+# ═══════════════════════════════════════════════════════════════
+# 用户本地持仓记录 (positions.json) — 轻量级，与主 portfolio.json 分离
+# ═══════════════════════════════════════════════════════════════
+
+POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "positions.json")
+
+DEFAULT_POSITIONS = {
+    "holdings": [],
+    "total_cash": 50000.0,
+    "last_updated": "",
+}
+
+
+def load_user_portfolio() -> dict:
+    """读取用户本地持仓 JSON，返回 {holdings, total_cash, last_updated}。"""
+    if not os.path.exists(POSITIONS_FILE):
+        _save_user_portfolio(DEFAULT_POSITIONS)
+        return dict(DEFAULT_POSITIONS)
+    try:
+        with open(POSITIONS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for key in DEFAULT_POSITIONS:
+            if key not in data:
+                data[key] = DEFAULT_POSITIONS[key]
+        return data
+    except Exception:
+        return dict(DEFAULT_POSITIONS)
+
+
+def _save_user_portfolio(data: dict):
+    """写入用户本地持仓 JSON。"""
+    data["last_updated"] = datetime.now().isoformat()
+    os.makedirs(os.path.dirname(POSITIONS_FILE), exist_ok=True)
+    with open(POSITIONS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def update_user_portfolio(symbol: str, name: str, entry_price: float,
+                          quantity: int, date: str) -> dict:
+    """新增或更新用户持仓，写回 positions.json。若已持有同代码则更新均价和数量。"""
+    data = load_user_portfolio()
+    holdings = data.get("holdings", [])
+
+    existing = None
+    for h in holdings:
+        if h.get("symbol") == symbol:
+            existing = h
+            break
+
+    if existing:
+        old_qty = int(existing.get("quantity", 0))
+        old_cost = float(existing.get("entry_price", 0)) * old_qty
+        new_cost = entry_price * quantity
+        total_qty = old_qty + quantity
+        existing["entry_price"] = round((old_cost + new_cost) / total_qty, 3) if total_qty > 0 else 0
+        existing["quantity"] = total_qty
+        existing["date"] = date
+        if name:
+            existing["name"] = name
+    else:
+        holdings.append({
+            "symbol": symbol,
+            "name": name,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "date": date,
+        })
+
+    data["holdings"] = holdings
+    _save_user_portfolio(data)
+    return data

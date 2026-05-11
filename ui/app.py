@@ -77,30 +77,32 @@ def _check_single_instance() -> bool:
 
 _stdout_lock = threading.Lock()
 
-class WorkerStdout:
-    """在 worker 线程中捕获 print()，节流发射到 GUI 防止信号洪泛导致 UI 冻结。"""
+class StreamingStdout:
+    """逐句流式输出 — 检测句号/换行即发射，实现 AI 对话式实时生长效果。"""
     def __init__(self, callback):
         self.callback = callback
         self.buffer = ""
-        self._last_emit = 0.0
-        self._min_interval = 0.15  # 最少 150ms 间隔，防止 UI 被海量信号淹没
 
     def write(self, text):
         if not text:
             return
         self.buffer += text
-        now = time.time()
-        # 节流：超过 150ms 或累积超过 4000 字符才发射信号
-        if len(self.buffer) >= 4000 or (now - self._last_emit >= self._min_interval):
-            self._do_emit()
-            self._last_emit = now
+        # 逐句切割：句号、问号、感叹号、换行、中文冒号后紧跟换行
+        import re as _re
+        while True:
+            m = _re.search(r'[。！？\n]|：\s*\n', self.buffer)
+            if not m:
+                break
+            idx = m.end()
+            sentence = self.buffer[:idx]
+            self.buffer = self.buffer[idx:]
+            s = sentence.strip()
+            if s:
+                self.callback(s)
 
     def flush(self):
-        self._do_emit()
-
-    def _do_emit(self):
-        if self.buffer.strip() and self.callback:
-            self.callback(self.buffer)
+        if self.buffer.strip():
+            self.callback(self.buffer.strip())
         self.buffer = ""
 
 
@@ -109,9 +111,12 @@ class WorkerStdout:
 # ═══════════════════════════════════════════════════════════════
 
 class AnalysisWorker(QObject):
-    """在后台线程执行分析任务，通过信号输出结果。"""
+    """在后台线程执行分析任务，通过信号输出结果。
+    逐句流式输出：chunk_signal 发射每句话，phase_signal 发射阶段切换。"""
     log_signal = Signal(str)
     progress_signal = Signal(int, str)  # percent, stage_name
+    chunk_signal = Signal(str)          # 逐句流式文本片段
+    phase_signal = Signal(int, str)     # (阶段号, 阶段名称)
     finished = Signal(object)
     error = Signal(str)
 
@@ -189,63 +194,135 @@ class AnalysisWorker(QObject):
         return cls._executor
 
     def _run_with_stdout(self, fn, timeout=120):
-        """通用：重定向 stdout → log_signal，执行 fn，发射 result。
-        包含心跳机制防止 Windows 判定程序无响应。"""
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, Future
+        """流式执行：逐句捕获 stdout → chunk_signal，阶段检测 → phase_signal。
+        Windows 心跳 2s，中断检测 1s 轮询。"""
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+        import traceback as _tb, re as _re
 
+        # ── 逐行追踪日志 ──
+        def _trace(msg: str):
+            try:
+                with open("analysis_trace.log", "a", encoding="utf-8") as _f:
+                    _f.write(f"[{time.time():.3f}] {msg}\n")
+            except Exception:
+                pass
+
+        _trace("Worker _run_with_stdout entered")
+
+        # ── 阶段检测正则（匹配 [1/5]、[2/4] 等）──
+        _phase_re = _re.compile(r'\[(\d+)/(\d+)\]\s*(.+)')
+
+        def _stream_emit(text: str):
+            """每句话发射到 chunk_signal + log_signal，检测阶段标题。"""
+            text = text.strip()
+            if not text:
+                return
+            # 阶段检测
+            m = _phase_re.search(text)
+            if m:
+                phase_num = int(m.group(1))
+                phase_name = m.group(3).strip().rstrip('.')
+                self.phase_signal.emit(phase_num, phase_name)
+            # 逐句流式
+            self.chunk_signal.emit(text)
+            self.log_signal.emit(text)
+
+        # ── 锁冲突降级路径 ──
         if not _stdout_lock.acquire(blocking=False):
+            _trace("Lock NOT acquired — running fn() directly on caller thread")
             try:
                 result = fn()
+                _trace("fn() completed (no-lock), emitting finished")
                 self.finished.emit(result)
             except Exception as e:
-                import traceback
-                self.log_signal.emit(f"\n❌ 错误: {e}\n{traceback.format_exc()}")
+                _trace(f"EXCEPTION (no-lock): {e}\n{_tb.format_exc()}")
+                self.chunk_signal.emit(f"\n❌ 错误: {e}")
+                self.log_signal.emit(f"\n❌ 错误: {e}\n{_tb.format_exc()}")
                 self.error.emit(str(e))
             return
 
-        def _emit(text):
-            self.log_signal.emit(text)
-
+        _trace("Lock acquired — redirecting stdout for streaming")
         old = sys.stdout
-        captured = WorkerStdout(_emit)
+        captured = StreamingStdout(_stream_emit)
         sys.stdout = captured
 
-        # 心跳线程：每 5 秒发射一次进度信号，防止 Windows 判定无响应
+        # ── 密集心跳：每 2s 发射一次，防 Windows 假死 ──
         heartbeat_running = [True]
         def _heartbeat():
             while heartbeat_running[0]:
-                time.sleep(5)
+                time.sleep(2)
                 if heartbeat_running[0]:
+                    self.chunk_signal.emit("")    # 空字符串唤醒消息循环
                     self.progress_signal.emit(0, "分析中...")
 
         heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
         heartbeat_thread.start()
 
         try:
-            self.progress_signal.emit(10, "加载中...")
+            _trace("Phase1: starting...")
+            self.chunk_signal.emit("🚀 开始分析...")
+            self.phase_signal.emit(0, "初始化中")
+            self.progress_signal.emit(5, "分析启动")
+
             executor = AnalysisWorker._get_executor()
             future = executor.submit(fn)
-            try:
-                result = future.result(timeout=timeout)
-            except FuturesTimeoutError:
+            _trace("fn() submitted to executor — polling with 1s intervals")
+
+            deadline = time.time() + timeout
+            result = None
+            got_result = False
+            while time.time() < deadline:
+                try:
+                    result = future.result(timeout=1.0)
+                    got_result = True
+                    _trace("future.result() returned OK")
+                    break
+                except FuturesTimeoutError:
+                    try:
+                        if self.thread() is not None and self.thread().isInterruptionRequested():
+                            _trace("Interruption requested — canceling")
+                            captured.flush()
+                            self.chunk_signal.emit("\n⏹ 分析已被用户中断")
+                            self.phase_signal.emit(0, "已中断")
+                            self.progress_signal.emit(0, "已中断")
+                            return
+                    except RuntimeError:
+                        pass
+                    continue
+
+            if not got_result:
+                _trace(f"Timeout after {timeout}s")
                 captured.flush()
-                self.log_signal.emit(f"\n⏰ 分析超时 ({timeout}s)，已停止等待")
+                msg = f"\n⏰ 分析超时 ({timeout}s)，已停止等待"
+                self.chunk_signal.emit(msg)
+                self.log_signal.emit(msg)
+                self.phase_signal.emit(0, "超时")
                 self.progress_signal.emit(0, "超时")
                 self.error.emit(f"分析超时 ({timeout}s)")
                 return
+
+            _trace("Flushing remaining stdout buffer...")
             captured.flush()
+            self.phase_signal.emit(99, "完成")
+            self.chunk_signal.emit("\n✅ 分析完成！")
             self.progress_signal.emit(100, "完成")
             self.finished.emit(result)
+
         except Exception as e:
+            _trace(f"EXCEPTION in worker: {e}\n{_tb.format_exc()}")
             captured.flush()
-            import traceback
-            self.log_signal.emit(f"\n❌ 错误: {e}\n{traceback.format_exc()}")
+            err = f"\n❌ 分析失败: {e}"
+            self.chunk_signal.emit(err)
+            self.log_signal.emit(f"{err}\n{_tb.format_exc()}")
+            self.phase_signal.emit(0, "失败")
             self.progress_signal.emit(0, "失败")
             self.error.emit(str(e))
         finally:
+            _trace("Cleanup: stopping heartbeat, restoring stdout, releasing lock")
             heartbeat_running[0] = False
             sys.stdout = old
             _stdout_lock.release()
+            _trace("Worker _run_with_stdout exiting")
 
 
 class OverviewWorker(QObject):
@@ -854,6 +931,30 @@ class AnalysisPage(QFrame):
             return
         self.output_text.append(text.rstrip('\n'))
 
+    def _on_chunk(self, text: str):
+        """流式追加文本片段到显示区，自动滚动到底部。"""
+        if not self._running:
+            return
+        t = text.rstrip('\n')
+        if t:
+            self.output_text.append(t)
+        # 滚动到底部
+        sb = self.output_text.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def _on_phase(self, phase_num: int, phase_name: str):
+        """插入阶段标题。"""
+        if not self._running:
+            return
+        markers = {0: "🔹", 1: "📊", 2: "🔬", 3: "⏱️", 4: "⚔️", 5: "🎯", 99: "✅"}
+        icon = markers.get(phase_num, "📌")
+        header = f"\n{'─'*50}\n{icon} [{phase_num}/5] {phase_name}\n{'─'*50}"
+        self.output_text.append(header)
+        sb = self.output_text.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
     def set_loading(self, loading: bool):
         self.analyze_btn.setEnabled(not loading)
         self.exec_btn.setEnabled(not loading)
@@ -867,14 +968,34 @@ class AnalysisPage(QFrame):
             self.progress.setValue(100)
 
     def start_analysis(self):
-        sym = self.symbol_input.text().strip()
-        if not sym:
-            QMessageBox.warning(self, "提示", "请输入股票代码")
-            return
-        self._clear_output()
-        self._append_output(f"🚀 开始深度分析: {sym}\n")
-        self.set_loading(True)
-        self._run_worker("deep", sym)
+        with open("button_click.log", "a") as f:
+            f.write(f"\n=== start_analysis called at {datetime.now().isoformat()} ===\n")
+        try:
+            sym = self.symbol_input.text().strip()
+            with open("button_click.log", "a") as f:
+                f.write(f"Symbol: '{sym}'\n")
+            if not sym:
+                QMessageBox.warning(self, "提示", "请输入股票代码")
+                return
+            with open("button_click.log", "a") as f:
+                f.write("Calling _clear_output...\n")
+            self._clear_output()
+            with open("button_click.log", "a") as f:
+                f.write("Calling _append_output...\n")
+            self._append_output(f"🚀 开始深度分析: {sym}\n")
+            with open("button_click.log", "a") as f:
+                f.write("Calling set_loading(True)...\n")
+            self.set_loading(True)
+            with open("button_click.log", "a") as f:
+                f.write("Calling _run_worker...\n")
+            self._run_worker("deep", sym)
+            with open("button_click.log", "a") as f:
+                f.write("_run_worker returned OK\n")
+        except Exception as e:
+            import traceback as _tb
+            with open("button_click.log", "a") as f:
+                f.write(f"EXCEPTION in start_analysis: {e}\n{_tb.format_exc()}\n")
+            raise
 
     def start_executive(self):
         sym = self.symbol_input.text().strip()
@@ -887,23 +1008,65 @@ class AnalysisPage(QFrame):
         self._run_worker("executive", sym)
 
     def _run_worker(self, mode: str, symbol: str):
-        self._current_symbol = symbol
-        self._thread = QThread()
-        self._worker = AnalysisWorker()
-        self._worker.moveToThread(self._thread)
+        with open("button_click.log", "a") as f:
+            f.write(f"_run_worker: mode={mode} symbol={symbol}\n")
+        try:
+            self._current_symbol = symbol
+            with open("button_click.log", "a") as f:
+                f.write("  Creating QThread...\n")
+            self._thread = QThread()
+            with open("button_click.log", "a") as f:
+                f.write(f"  QThread created: {self._thread}\n")
+            with open("button_click.log", "a") as f:
+                f.write("  Creating AnalysisWorker...\n")
+            self._worker = AnalysisWorker()
+            with open("button_click.log", "a") as f:
+                f.write(f"  AnalysisWorker created: {self._worker}\n")
+            with open("button_click.log", "a") as f:
+                f.write("  Calling moveToThread...\n")
+            self._worker.moveToThread(self._thread)
+            with open("button_click.log", "a") as f:
+                f.write("  moveToThread OK\n")
 
-        if mode == "deep":
-            use_pf = self.portfolio_cb.isChecked()
-            use_ap = self.adaptive_cb.isChecked()
-            self._thread.started.connect(lambda: self._worker.run_deep_analysis(symbol, use_pf, use_ap))
-        else:
-            self._thread.started.connect(lambda: self._worker.run_executive(symbol))
+            if mode == "deep":
+                use_pf = self.portfolio_cb.isChecked()
+                use_ap = self.adaptive_cb.isChecked()
+                with open("button_click.log", "a") as f:
+                    f.write(f"  Connecting started signal (deep: pf={use_pf} ap={use_ap})...\n")
+                self._thread.started.connect(lambda: self._worker.run_deep_analysis(symbol, use_pf, use_ap))
+            else:
+                with open("button_click.log", "a") as f:
+                    f.write("  Connecting started signal (executive)...\n")
+                self._thread.started.connect(lambda: self._worker.run_executive(symbol))
 
-        self._worker.log_signal.connect(self._append_output)
-        self._worker.finished.connect(self._on_worker_finished)
-        self._worker.error.connect(self._on_worker_error)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+            with open("button_click.log", "a") as f:
+                f.write("  Connecting log_signal...\n")
+            self._worker.log_signal.connect(self._append_output)
+            with open("button_click.log", "a") as f:
+                f.write("  Connecting chunk_signal...\n")
+            self._worker.chunk_signal.connect(self._on_chunk)
+            with open("button_click.log", "a") as f:
+                f.write("  Connecting phase_signal...\n")
+            self._worker.phase_signal.connect(self._on_phase)
+            with open("button_click.log", "a") as f:
+                f.write("  Connecting finished...\n")
+            self._worker.finished.connect(self._on_worker_finished)
+            with open("button_click.log", "a") as f:
+                f.write("  Connecting error...\n")
+            self._worker.error.connect(self._on_worker_error)
+            with open("button_click.log", "a") as f:
+                f.write("  Connecting finished -> deleteLater...\n")
+            self._thread.finished.connect(self._thread.deleteLater)
+            with open("button_click.log", "a") as f:
+                f.write("  Calling thread.start()...\n")
+            self._thread.start()
+            with open("button_click.log", "a") as f:
+                f.write("  thread.start() returned OK\n")
+        except Exception as e:
+            import traceback as _tb2
+            with open("button_click.log", "a") as f:
+                f.write(f"  EXCEPTION in _run_worker: {e}\n{_tb2.format_exc()}\n")
+            raise
 
     def _on_worker_finished(self, result):
         self.set_loading(False)
@@ -1005,6 +1168,27 @@ class ScreeningPage(QFrame):
             return
         self.screen_output_text.append(text.rstrip('\n'))
 
+    def _on_chunk(self, text: str):
+        """流式追加选股进度。"""
+        if not self._running:
+            return
+        t = text.rstrip('\n')
+        if t:
+            self.screen_output_text.append(t)
+        sb = self.screen_output_text.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def _on_phase(self, phase_num: int, phase_name: str):
+        """选股阶段标题。"""
+        if not self._running:
+            return
+        header = f"\n{'─'*40}\n📌 阶段 {phase_num}: {phase_name}\n{'─'*40}"
+        self.screen_output_text.append(header)
+        sb = self.screen_output_text.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
     def _clear(self):
         """清除之前的选股结果。"""
         self._running = True
@@ -1038,6 +1222,8 @@ class ScreeningPage(QFrame):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(lambda: self._worker.run_screening(scope, top_n))
         self._worker.log_signal.connect(self._append)
+        self._worker.chunk_signal.connect(self._on_chunk)
+        self._worker.phase_signal.connect(self._on_phase)
         self._worker.finished.connect(self._on_screen_done)
         self._worker.error.connect(self._on_screen_error)
         self._thread.finished.connect(self._thread.deleteLater)
@@ -1211,6 +1397,8 @@ class EvolutionPage(QFrame):
         elif mode == "adaptation":
             self._thread.started.connect(lambda: self._worker.run_adaptation(kwargs['symbol']))
         self._worker.log_signal.connect(self._on_log)
+        self._worker.chunk_signal.connect(self._on_chunk)
+        self._worker.phase_signal.connect(self._on_phase)
         self._worker.progress_signal.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
@@ -1250,6 +1438,19 @@ class EvolutionPage(QFrame):
         current_tab = self.tabs.currentWidget()
         if hasattr(current_tab, '_append'):
             current_tab._append(text)
+
+    def _on_chunk(self, text: str):
+        current_tab = self.tabs.currentWidget()
+        t = text.rstrip('\n')
+        if not t:
+            return
+        if hasattr(current_tab, '_on_chunk'):
+            current_tab._on_chunk(t)
+        elif hasattr(current_tab, '_append'):
+            current_tab._append(t)
+
+    def _on_phase(self, phase_num: int, phase_name: str):
+        pass  # EvolutionPage tabs don't use phase display
 
     def _on_progress(self, pct, stage):
         self.backtest_tab.progress.setValue(pct)
@@ -2256,20 +2457,87 @@ class MainWindow(QMainWindow):
         self.nav.currentRowChanged.connect(self._switch_page)
         content_layout.addWidget(self.nav)
 
-        # ── 页面栈 ──
+        # ── 页面栈（首屏秒开：先放占位，延迟加载真实页面）──
         self.stack = QStackedWidget()
         self.stack.setObjectName("centralFrame")
-        self.overview = OverviewPage()
-        self.analysis = AnalysisPage()
-        self.screening = ScreeningPage()
-        self.evolution = EvolutionPage()
-        self.settings = SettingsPage()
 
-        self.stack.addWidget(self.overview)
-        self.stack.addWidget(self.analysis)
-        self.stack.addWidget(self.screening)
-        self.stack.addWidget(self.evolution)
-        self.stack.addWidget(self.settings)
+        def _make_placeholder(text: str) -> QWidget:
+            pw = QWidget()
+            pl = QVBoxLayout(pw)
+            pl.setAlignment(Qt.AlignCenter)
+            lbl = QLabel(text)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("font-size: 18px; color: #7982a9; font-weight: 500;")
+            pl.addWidget(lbl)
+            return pw
+
+        self._ph_overview = _make_placeholder("📊 总览页面加载中…")
+        self._ph_analysis = _make_placeholder("🔍 分析页面加载中…")
+        self._ph_screening = _make_placeholder("💡 选股页面加载中…")
+        self._ph_evolution = _make_placeholder("🧬 策略进化加载中…")
+        self._ph_settings = _make_placeholder("⚙️ 设置页面加载中…")
+
+        self.stack.addWidget(self._ph_overview)
+        self.stack.addWidget(self._ph_analysis)
+        self.stack.addWidget(self._ph_screening)
+        self.stack.addWidget(self._ph_evolution)
+        self.stack.addWidget(self._ph_settings)
+
+        # 页面引用初始为 None，延迟创建后替换占位
+        self.overview = None
+        self.analysis = None
+        self.screening = None
+        self.evolution = None
+        self.settings = None
+
+        # ── 延迟加载回调 ──
+        def _replace_page(index: int, real_page, placeholder):
+            self.stack.insertWidget(index, real_page)
+            self.stack.removeWidget(placeholder)
+            placeholder.deleteLater()
+
+        def _load_settings():
+            self.settings = SettingsPage()
+            self.settings.theme_toggled.connect(self._apply_theme)
+            self.settings.scheduler_toggled.connect(self._toggle_scheduler)
+            self.settings.mail_listener_toggled.connect(self._toggle_mail_listener)
+            _replace_page(4, self.settings, self._ph_settings)
+
+        def _load_evolution():
+            self.evolution = EvolutionPage()
+            _replace_page(3, self.evolution, self._ph_evolution)
+
+        def _load_screening():
+            self.screening = ScreeningPage()
+            self.screening.analyze_requested.connect(self._jump_to_analysis)
+            self.screening.quick_adapt_requested.connect(self._jump_to_evolution_adapt)
+            self.screening.screen_btn.clicked.connect(self.screening.start)
+            _replace_page(2, self.screening, self._ph_screening)
+
+        def _load_analysis():
+            self.analysis = AnalysisPage()
+            self.analysis.symbol_input.returnPressed.connect(self.analysis.start_analysis)
+            self.analysis.analyze_btn.clicked.connect(self.analysis.start_analysis)
+            self.analysis.exec_btn.clicked.connect(self.analysis.start_executive)
+            _replace_page(1, self.analysis, self._ph_analysis)
+
+        def _load_overview():
+            self.overview = OverviewPage()
+            self.overview.analyze_requested.connect(self._jump_to_analysis)
+            _replace_page(0, self.overview, self._ph_overview)
+            # 首次刷新
+            QTimer.singleShot(200, self.overview.refresh)
+            # 定时刷新
+            self._refresh_timer = QTimer(self)
+            self._refresh_timer.timeout.connect(self.overview.refresh)
+            self._refresh_timer.start(30000)
+
+        # 分批延迟加载：先出首屏，再加载分析页 → 选股页 → 进化页 → 总览页
+        QTimer.singleShot(50, _load_analysis)
+        QTimer.singleShot(100, _load_screening)
+        QTimer.singleShot(150, _load_evolution)
+        QTimer.singleShot(200, _load_overview)
+        QTimer.singleShot(30, _load_settings)
 
         content_layout.addWidget(self.stack, stretch=1)
         main_layout.addWidget(content, stretch=1)
@@ -2283,28 +2551,8 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage("就绪")
         main_layout.addWidget(self._status_bar)
 
-        # ── 信号连接 ──
-        self.overview.analyze_requested.connect(self._jump_to_analysis)
-        self.screening.analyze_requested.connect(self._jump_to_analysis)
-        self.screening.quick_adapt_requested.connect(self._jump_to_evolution_adapt)
-        self.analysis.symbol_input.returnPressed.connect(self.analysis.start_analysis)
-        self.analysis.analyze_btn.clicked.connect(self.analysis.start_analysis)
-        self.analysis.exec_btn.clicked.connect(self.analysis.start_executive)
-        self.screening.screen_btn.clicked.connect(self.screening.start)
-        self.settings.theme_toggled.connect(self._apply_theme)
-        self.settings.scheduler_toggled.connect(self._toggle_scheduler)
-        self.settings.mail_listener_toggled.connect(self._toggle_mail_listener)
-
         # ── 应用默认主题 ──
         self._apply_theme(True)
-
-        # ── 定时刷新 ──
-        self._refresh_timer = QTimer(self)
-        self._refresh_timer.timeout.connect(self.overview.refresh)
-        self._refresh_timer.start(30000)  # 每30秒
-
-        # ── 首次加载 ──
-        QTimer.singleShot(200, self.overview.refresh)
 
         # ── 启动邮件监听 ──
         QTimer.singleShot(3000, self._auto_start_mail_listener)
@@ -2392,19 +2640,21 @@ class MainWindow(QMainWindow):
     # ── 页面切换 ──
     def _switch_page(self, index: int):
         self.stack.setCurrentIndex(index)
-        if index == 0:  # 总览页
+        if index == 0 and self.overview is not None:
             self.overview.refresh()
 
     def _jump_to_analysis(self, symbol: str):
         self.nav.setCurrentRow(1)
-        self.analysis.symbol_input.setText(symbol)
-        self.analysis.start_analysis()
+        if self.analysis is not None:
+            self.analysis.symbol_input.setText(symbol)
+            self.analysis.start_analysis()
 
     def _jump_to_evolution_adapt(self, symbol: str):
         self.nav.setCurrentRow(3)
-        self.evolution.tabs.setCurrentIndex(1)  # Adaptive Migration tab
-        self.evolution.adapt_tab.symbol_input.setText(symbol)
-        self.evolution.adapt_tab.adapt_requested.emit(symbol)
+        if self.evolution is not None:
+            self.evolution.tabs.setCurrentIndex(1)
+            self.evolution.adapt_tab.symbol_input.setText(symbol)
+            self.evolution.adapt_tab.adapt_requested.emit(symbol)
 
     # ── 主题切换 ──
     def _toggle_theme(self):
@@ -2422,7 +2672,8 @@ class MainWindow(QMainWindow):
         down_color = theme['down']
 
         # 更新 overview 盈亏颜色
-        QTimer.singleShot(100, self.overview.refresh)
+        if self.overview is not None:
+            QTimer.singleShot(100, self.overview.refresh)
 
     # ── 调度器 ──
     def _toggle_scheduler(self, running: bool):
@@ -2500,7 +2751,7 @@ class MainWindow(QMainWindow):
         menu.addAction(show_action)
 
         refresh_action = QAction("🔄 刷新持仓", self)
-        refresh_action.triggered.connect(lambda: self.overview.refresh())
+        refresh_action.triggered.connect(lambda: self.overview.refresh() if self.overview is not None else None)
         menu.addAction(refresh_action)
 
         menu.addSeparator()
@@ -2561,11 +2812,25 @@ class MainWindow(QMainWindow):
         """隐藏到系统托盘。"""
         self.hide()
 
+    def _cleanup_all_workers(self):
+        """安全停止所有后台工作线程（AnalysisWorker / OverviewWorker）。"""
+        for page in [self.overview, self.analysis, self.screening, self.evolution]:
+            t = getattr(page, '_thread', None)
+            if t is not None and t.isRunning():
+                try:
+                    t.requestInterruption()
+                    t.quit()
+                    if not t.wait(5000):
+                        print(f"[Cleanup] 线程未能在5秒内停止: {t}", flush=True)
+                except Exception:
+                    pass
+
     def closeEvent(self, event):
         if self._tray_icon and self._tray_icon.isVisible():
             self.hide_to_tray()
             event.ignore()
         else:
+            self._cleanup_all_workers()
             event.accept()
 
     def quit_app(self):
@@ -2574,6 +2839,7 @@ class MainWindow(QMainWindow):
             self._tray_icon = None
         if self._scheduler:
             self._scheduler.running = False
+        self._cleanup_all_workers()
         self.close()
         QApplication.quit()
 

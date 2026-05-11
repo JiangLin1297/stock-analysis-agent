@@ -54,6 +54,22 @@ def _fmt_json(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, separators=(',', ':'))
 
 
+def _safe_debate_chat(system_prompt: str, user_content: str, role_label: str) -> dict:
+    """安全调用 DeepSeek API，超时/连接错误时返回默认 JSON。"""
+    try:
+        raw = deepseek_chat(system_prompt, user_content, timeout=30)
+        result = _parse_json(raw)
+        if result.get("parse_error"):
+            print(f"  [WARN] {role_label} 回复无法解析JSON，使用默认值")
+            return {"points": ["（AI 分析暂时不可用，使用本地因子替代）"],
+                    "conviction": 0.5, "parse_error": True}
+        return result
+    except Exception as e:
+        print(f"  [WARN] {role_label} API调用失败: {e}，使用本地替代")
+        return {"points": ["（AI 分析暂时不可用，使用本地因子替代）"],
+                "conviction": 0.5, "parse_error": True}
+
+
 def run_debate(agent_reports: list[dict], use_mock: bool = False,
                time_frame_opinions: dict = None) -> dict:
     """
@@ -89,17 +105,18 @@ def run_debate(agent_reports: list[dict], use_mock: bool = False,
     mod_prompt = DEBATE_PROMPTS["moderator"]
 
     rounds = []
+    api_failures = 0
 
     # ── Round 1: 多头初始 → 空头反驳 ──
     print(f"\n{section_div(' ROUND 1: 多头研究员 -> 空头研究员 ')}")
 
-    bull_r1_raw = deepseek_chat(bull_prompt, f"分析报告:\n{ctx}\n\n请给出你的看多论点。")
-    bull_r1 = _parse_json(bull_r1_raw)
+    bull_r1 = _safe_debate_chat(bull_prompt, f"分析报告:\n{ctx}\n\n请给出你的看多论点。", "多头R1")
+    if bull_r1.get("parse_error"): api_failures += 1
     rounds.append({"round": 1, "role": "bull", "output": bull_r1})
     print(card_line(f"[多 BULL] {_fmt_json(bull_r1)[:280]}"))
 
-    bear_r1_raw = deepseek_chat(bear_prompt, f"多头论点:\n{_fmt_json(bull_r1)}\n\n请逐条反驳。")
-    bear_r1 = _parse_json(bear_r1_raw)
+    bear_r1 = _safe_debate_chat(bear_prompt, f"多头论点:\n{_fmt_json(bull_r1)}\n\n请逐条反驳。", "空头R1")
+    if bear_r1.get("parse_error"): api_failures += 1
     rounds.append({"round": 1, "role": "bear", "output": bear_r1})
     print(card_line(f"[空 BEAR] {_fmt_json(bear_r1)[:280]}"))
     print(card_bottom())
@@ -107,13 +124,13 @@ def run_debate(agent_reports: list[dict], use_mock: bool = False,
     # ── Round 2: 多头回应 → 空头最终 ──
     print(f"\n{section_div(' ROUND 2: 多头回应 -> 空头最终 ')}")
 
-    bull_r2_raw = deepseek_chat(bull_prompt, f"空头反驳:\n{_fmt_json(bear_r1)}\n\n请逐条回应。")
-    bull_r2 = _parse_json(bull_r2_raw)
+    bull_r2 = _safe_debate_chat(bull_prompt, f"空头反驳:\n{_fmt_json(bear_r1)}\n\n请逐条回应。", "多头R2")
+    if bull_r2.get("parse_error"): api_failures += 1
     rounds.append({"round": 2, "role": "bull", "output": bull_r2})
     print(card_line(f"[多 BULL] {_fmt_json(bull_r2)[:280]}"))
 
-    bear_r2_raw = deepseek_chat(bear_prompt, f"多头回应:\n{_fmt_json(bull_r2)}\n\n请做最终反驳。")
-    bear_r2 = _parse_json(bear_r2_raw)
+    bear_r2 = _safe_debate_chat(bear_prompt, f"多头回应:\n{_fmt_json(bull_r2)}\n\n请做最终反驳。", "空头R2")
+    if bear_r2.get("parse_error"): api_failures += 1
     rounds.append({"round": 2, "role": "bear", "output": bear_r2})
     print(card_line(f"[空 BEAR] {_fmt_json(bear_r2)[:280]}"))
     print(card_bottom())
@@ -139,10 +156,22 @@ def run_debate(agent_reports: list[dict], use_mock: bool = False,
         mod_input += "\n请在仲裁输出中额外包含 leaning_short/leaning_mid/leaning_long (0.0-1.0) 三个评分，表示对短线/中线/长线的倾向程度。"
     mod_input += "\n\n请仲裁。"
 
-    mod_raw = deepseek_chat(mod_prompt, mod_input)
-    moderation = _parse_json(mod_raw)
+    moderation = _safe_debate_chat(mod_prompt, mod_input, "仲裁员")
+    if moderation.get("parse_error"): api_failures += 1
     print(card_line(f"[裁 MODERATOR] {_fmt_json(moderation)[:400]}"))
     print(card_bottom())
+
+    # 全部 API 调用失败时，返回空辩论结果，不阻断流程
+    if api_failures >= 5:
+        print("  [INFO] 辩论API全部失败，返回空辩论结果，不影响决策流程")
+        return {
+            "rounds": [],
+            "moderation": {"bull_score": 0.5, "bear_score": 0.5, "winner": "API不可用",
+                           "summary": "辩论API全部超时/失败，使用因子模型替代",
+                           "key_divergence": "无"},
+            "all_rounds_text": "API不可用，跳过辩论",
+            "leaning_short": 0.5, "leaning_mid": 0.5, "leaning_long": 0.5,
+        }
 
     # 提取三线倾向评分
     leaning_short = float(moderation.get("leaning_short", 0.5)) if not moderation.get("parse_error") else 0.5

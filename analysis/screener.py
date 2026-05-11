@@ -736,16 +736,21 @@ def screen_stocks(market: str = "A", criteria: dict = None,
             except Exception as e:
                 # 单只股票失败不中断整体流程
                 pass
-            if completed % 50 == 0 or completed == total:
-                print(f"  进度: {completed}/{total}")
+            if completed % 10 == 0 or completed == total:
+                print(f"  抓取进度: {completed}/{total}")
 
     print(f"  成功获取 {len(results)} 只股票的完整数据")
 
     # ── Step 4: 打分、过滤、排序 ──
     print(f"\n[4/4] 打分 & 排序...")
     scored = []
-    for stock in results:
+    for i, stock in enumerate(results):
         score, checks = _score_one(stock, crit)
+        sym = stock.get("symbol", "?")
+        name = stock.get("name", "")
+        # 逐只输出进度
+        verdict = "✅" if score >= 5 else ("📈" if score >= 3 else "❌")
+        print(f"  [{i+1}/{len(results)}] {sym} {name} → 评分 {score} {verdict}")
         # 过滤条件：至少满足 3 项以上才纳入
         if score >= 3:
             stock["score"] = score

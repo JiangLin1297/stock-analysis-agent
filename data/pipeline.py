@@ -288,61 +288,66 @@ def fetch_news(symbol):
     """获取近5条新闻，每项包含 title + url + source。"""
     items = []
 
-    # 来源1: akshare 东方财富个股新闻 (含URL)
+    # 来源1: 东方财富公告 API (直接 HTTP，绕过有bug的akshare stock_news_em)
     try:
-        df = ak.stock_news_em(symbol=symbol)
-        if df is not None and not df.empty:
-            for _, row in df.head(10).iterrows():
-                title, news_url = _extract_news_row(row, source="东方财富个股新闻")
-                if title and len(items) < 5:
-                    items.append({
-                        "title": title[:80],
-                        "url": news_url or f"https://so.eastmoney.com/news/s?keyword={symbol}",
-                        "source": "东方财富",
-                    })
-    except Exception:
-        pass
+        import requests as _req
+        url = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+        resp = _req.get(url, params={"page_size": 10, "page_index": 1, "stock_list": symbol},
+                       timeout=(5, 10))
+        if resp.status_code == 200:
+            data = resp.json()
+            announcements = data.get("data", {}).get("list", [])
+            if announcements:
+                for ann in announcements:
+                    title = (ann.get("title") or ann.get("notice_title") or "").strip()
+                    art_code = ann.get("art_code", "")
+                    notice_date = ann.get("notice_date", "")
+                    if title and len(items) < 5:
+                        items.append({
+                            "title": title[:80],
+                            "url": f"https://data.eastmoney.com/notices/detail/{symbol}/{art_code}.html" if art_code else f"https://so.eastmoney.com/news/s?keyword={symbol}",
+                            "source": "东方财富公告",
+                            "time": str(notice_date),
+                        })
+                print(f"  [news] 东方财富公告: {len(items)}条")
+            else:
+                print(f"  [news] 东方财富公告: 无数据返回")
+        else:
+            print(f"  [news] 东方财富公告: HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  [news] 东方财富公告: 获取失败 ({e})")
 
     if len(items) >= 5:
+        print(f"  [news] 总计: {len(items)}条 (东方财富)")
         return items
 
-    # 来源2: akshare 财联社电报
+    # 来源2: 财新全球市场动态 (akshare stock_news_main_cx)
     try:
-        df = ak.stock_info_global_news()
+        df = ak.stock_news_main_cx()
         if df is not None and not df.empty:
+            count_before = len(items)
             for _, row in df.head(10).iterrows():
-                title, news_url = _extract_news_row(row, source="财联社电报")
-                if title and len(items) < 5:
+                summary = str(row.get('summary', ''))
+                tag = str(row.get('tag', ''))
+                row_url = str(row.get('url', ''))
+                if summary and summary not in ('nan', 'None', '') and len(items) < 5:
                     items.append({
-                        "title": title[:80],
-                        "url": news_url or "https://www.cls.cn/searchPage?keyword=" + symbol,
-                        "source": "财联社",
+                        "title": summary[:80],
+                        "url": row_url if row_url.startswith('http') else f"https://www.cls.cn/searchPage?keyword={symbol}",
+                        "source": f"财新·{tag}" if tag not in ('nan', 'None') else "财新",
                     })
-    except Exception:
-        pass
+            added = len(items) - count_before
+            print(f"  [news] 财新全球: {added}条")
+        else:
+            print(f"  [news] 财新全球: 无数据返回")
+    except Exception as e:
+        print(f"  [news] 财新全球: 获取失败 ({e})")
 
+    if not items:
+        print(f"  [news] 总计: 0条，新闻数据不可用")
+    else:
+        print(f"  [news] 总计: {len(items)}条")
     return items
-
-
-def _extract_news_row(row, source=""):
-    """从 DataFrame 行提取标题和URL。"""
-    title = None
-    for col in ['标题', 'title', 'title_ch', 'content', '新闻标题', 'name']:
-        if col in row.index:
-            t = str(row[col])
-            if t and t not in ('nan', 'None', ''):
-                title = t[:80]
-                break
-
-    news_url = None
-    for col in ['url', 'URL', '链接', '新闻链接', 'art_url', 'share_url']:
-        if col in row.index:
-            u = str(row[col])
-            if u and u not in ('nan', 'None', '') and u.startswith('http'):
-                news_url = u
-                break
-
-    return title, news_url
 
 
 # ── 4. 财务数据 ───────────────────────────────────────────
@@ -727,6 +732,10 @@ def get_compressed_data(symbol: str, market: str = "A") -> dict:
     }
 
     # 各数据源独立获取，单个失败不影响整体
+    # 各字段默认值必须与函数返回类型一致：list 字段用 []，dict 字段用 {}
+    _DEFAULT_RESULT = {
+        "quote": {}, "technical": {}, "news": [], "financial": {}, "macro": {},
+    }
     for name, fn, args, timeout_sec in [
         ("quote", fetch_spot, (symbol, exchange), 10),
         ("technical", fetch_kline_indicators, (symbol, exchange), 15),
@@ -735,10 +744,10 @@ def get_compressed_data(symbol: str, market: str = "A") -> dict:
         ("macro", fetch_macro, (), 5),
     ]:
         try:
-            result[name] = run_with_timeout(fn, timeout_sec, *args) or {}
+            result[name] = run_with_timeout(fn, timeout_sec, *args) or _DEFAULT_RESULT.get(name, {})
         except Exception as e:
             print(f"  ⚠ {name} 获取失败: {e}")
-            result[name] = {"error": str(e)}
+            result[name] = _DEFAULT_RESULT.get(name, {"error": str(e)})
 
     # 计算突破入场信号
     result["breakout_signals"] = _compute_breakout_signals(result)

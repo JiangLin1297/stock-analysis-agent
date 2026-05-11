@@ -34,6 +34,9 @@ _DEFAULT_MODEL = "deepseek-v4-pro"
 _DEFAULT_TEMPERATURE = 0.7
 _DEFAULT_MAX_TOKENS = 8192
 _DEFAULT_TIMEOUT = 30
+_DEFAULT_CONNECT_TIMEOUT = 8
+_MAX_RETRIES = 2
+_RETRY_BACKOFF = [2, 4]  # 指数退避秒数
 
 
 def _load_config_from_file():
@@ -104,7 +107,7 @@ class DeepSeekClient:
         **kwargs
     ) -> str:
         """
-        调用 DeepSeek V4 API（OpenAI 兼容接口）。
+        调用 DeepSeek V4 API（OpenAI 兼容接口），带自动重试。
 
         Args:
             system_prompt: 系统级指令，定义角色和行为。
@@ -115,15 +118,14 @@ class DeepSeekClient:
                 max_tokens  - 最大输出 token 数
                 base_url    - API 地址
                 api_key     - API 密钥
-                timeout     - 请求超时秒数
+                timeout     - 请求超时秒数(单值=read timeout; tuple=(connect, read))
                 extra_body  - 额外请求体字段 (dict)
 
         Returns:
             str: 模型回复文本。
 
         Raises:
-            requests.HTTPError: HTTP 错误。
-            KeyError: 响应格式不兼容。
+            requests.HTTPError: HTTP 错误（非超时）。
             ValueError: API Key 未设置。
         """
         with self._config_lock:
@@ -142,8 +144,14 @@ class DeepSeekClient:
                 "或在系统环境变量中永久配置。"
             )
 
-        url = f"{base_url.rstrip('/')}/chat/completions"
+        # 超时处理：支持单值和元组
+        if isinstance(timeout, (int, float)):
+            connect_to = _DEFAULT_CONNECT_TIMEOUT
+            read_to = timeout
+        else:
+            connect_to, read_to = timeout
 
+        url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json"}
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -158,15 +166,29 @@ class DeepSeekClient:
             **extra_body,
         }
 
-        resp = requests.post(url, json=payload, headers=headers, timeout=(5, timeout))
-        resp.raise_for_status()
-        data = resp.json()
+        last_error = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=(connect_to, read_to))
+                resp.raise_for_status()
+                data = resp.json()
+                msg = data["choices"][0]["message"]
+                content = msg.get("content", "")
+                if not content:
+                    content = msg.get("reasoning_content", "")
+                return content
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                last_error = e
+                if attempt < _MAX_RETRIES:
+                    wait = _RETRY_BACKOFF[attempt]
+                    import time as _time
+                    _time.sleep(wait)
+            except Exception as e:
+                # 非网络错误（HTTP 4xx/5xx 等），不重试
+                raise
 
-        msg = data["choices"][0]["message"]
-        content = msg.get("content", "")
-        if not content:
-            content = msg.get("reasoning_content", "")
-        return content
+        raise last_error
 
     def chat_stream(
         self,

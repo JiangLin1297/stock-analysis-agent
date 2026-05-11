@@ -11,7 +11,47 @@ StockMind Desktop Launcher
     window.show()
     sys.exit(app.exec())
 """
+# ═══════════ OS 级崩溃捕捉（C 层信号 + Windows VEH）═══════════
+import sys, os, signal, traceback as _tb_crash
 
+def crash_handler(signum, frame):
+    err = f"SIGNAL {signum} at:\n" + ''.join(_tb_crash.format_stack(frame))
+    try:
+        with open("fatal_signal.log", "a") as _f:
+            _f.write(err + "\n")
+    except Exception:
+        pass
+    print(err, flush=True)
+    sys.exit(1)
+
+signal.signal(signal.SIGSEGV, crash_handler)
+try:
+    signal.signal(signal.SIGABRT, crash_handler)
+except Exception:
+    pass
+
+# Windows 向量化异常处理器 — 捕捉真正的 C 层访问违规
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        from datetime import datetime as _dt
+        _VectoredHandler = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+        def _veh_crash(exception_info_ptr):
+            try:
+                with open("fatal_signal.log", "a") as _f:
+                    _f.write(f"VEH CRASH at {_dt.now().isoformat()}\n")
+            except Exception:
+                pass
+            return 0  # EXCEPTION_CONTINUE_SEARCH → 让 Windows 弹出标准崩溃框
+        _veh_cb = _VectoredHandler(_veh_crash)
+        ctypes.windll.kernel32.AddVectoredExceptionHandler(1, _veh_cb)
+    except Exception:
+        pass
+
+with open("debug_startup.log", "w") as f:
+    f.write("STARTED\n")
+    import traceback
+    f.write(traceback.format_stack()[-2] if len(traceback.format_stack()) > 1 else "no stack")
 import sys
 import os
 import traceback
@@ -31,6 +71,10 @@ def _global_exception_hook(exc_type, exc_value, exc_tb):
     """将未捕获异常写入 crash_log.txt 并弹窗提示。"""
     tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
     crash_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 崩溃\n" + "".join(tb_lines)
+
+    # 立刻输出到控制台 — 确保在 GUI 崩溃前能看到
+    print(f"UNCAUGHT: {exc_type.__name__}: {exc_value}", flush=True)
+    traceback.print_tb(exc_tb)
 
     try:
         with open(_crash_log_path(), 'a', encoding='utf-8') as f:

@@ -29,6 +29,8 @@ def _build_context(compressed_data: dict, agent_reports: list[dict]) -> str:
     t = compressed_data.get("technical", {})
     f = compressed_data.get("financial", {})
     news = compressed_data.get("news", [])
+    if not isinstance(news, list):
+        news = list(news.values()) if isinstance(news, dict) else []
     bs = compressed_data.get("breakout_signals", {})
 
     parts = [f"股票: {q.get('name','?')} ({compressed_data.get('symbol','?')})",
@@ -55,7 +57,10 @@ def _build_context(compressed_data: dict, agent_reports: list[dict]) -> str:
 
     parts.append("--- 分析师报告摘要 ---")
     for r in agent_reports:
-        parts.append(f"[{r['agent']}] {r['signal']} score={r['score']} conf={r['confidence']} {r.get('reasoning','')[:60]}")
+        if not isinstance(r, dict):
+            parts.append(f"[?] {str(r)[:80]}")
+            continue
+        parts.append(f"[{r.get('agent','?')}] {r.get('signal','?')} score={r.get('score',0)} conf={r.get('confidence',0)} {str(r.get('reasoning',''))[:60]}")
 
     # 趋势状态注入
     trend = compressed_data.get("trend_state", {})
@@ -69,7 +74,14 @@ def _build_context(compressed_data: dict, agent_reports: list[dict]) -> str:
     elif trend_state == "BULL":
         parts.append("BULL提示: 牛市环境，仓位可更积极，优先趋势跟踪和突破追入策略。")
 
-    news_titles = [n if isinstance(n, str) else n.get("title", "") for n in news[:5]]
+    news_titles = []
+    for n in news[:5]:
+        if isinstance(n, str):
+            news_titles.append(n)
+        elif isinstance(n, dict):
+            news_titles.append(n.get("title", ""))
+        else:
+            news_titles.append(str(n))
     if news_titles:
         parts.append("--- 近期新闻 ---")
         parts.extend(news_titles[:3])

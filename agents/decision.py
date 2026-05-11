@@ -510,20 +510,22 @@ def _mock_decision_3d(compressed_data: dict, agent_reports: list[dict],
 
 def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
                       position: dict = None, use_portfolio: bool = False,
-                      historical_date=None, use_adapted_params: bool = False) -> dict:
+                      historical_date=None, use_adapted_params: bool = False,
+                      use_llm_pipeline: bool = False) -> dict:
     """
-    主流程：数据 → Agent → 辩论 → 决策。
-    返回包含所有中间结果的完整字典。
+    主流程：默认使用因子模型 (LLM提取结构化数据 → 因子引擎生成信号)。
+
+    量化基金架构:
+      - LLM Agent: 提取结构化数据 (趋势强度/估值评分/情绪评分等)
+      - 因子引擎: generate_3d_factor_signals 生成最终 BUY/SELL/HOLD
+      - LLM 复核层: 仅在因子评分临界区(50-65分)时调用，只可否决不买入
 
     Args:
         symbol: 股票代码
-        market: 市场类型 (A=A股)
-        use_mock: False=调用DeepSeek API, True=启发式模拟(快速但精度低)
-        position: 可选，单票持仓 {"entry_price": xx, "quantity": xx}
-                  传入后额外计算退出建议
-        use_portfolio: True=从 portfolio.json 加载完整持仓上下文
-        historical_date: 可选，历史日期字符串'2024-06-15'。传入后使用历史快照模式
-        use_adapted_params: True=自动加载 {symbol}_adapted_params.json 并注入仓位/风控/信号阈值
+        use_mock: True=启发式模拟, False=调用DeepSeek API
+        use_portfolio: True=加载持仓上下文
+        use_adapted_params: True=加载自适应参数
+        use_llm_pipeline: True=使用旧版全LLM管线(Agent→辩论→LLM决策)，默认False
     """
     from data.pipeline import get_compressed_data, get_historical_snapshot
     from agents.runner import run_all_agents
@@ -547,58 +549,54 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         else:
             print(f"  [Adaptive] 未找到 {symbol}_adapted_params.json，使用默认参数")
 
+    mode_label = "DeepSeek V4 Pro 实调" if not use_mock else "Mock模拟"
+    pipeline_label = "全LLM管线" if use_llm_pipeline else "因子模型 (LLM提取数据→因子引擎决策)"
     if historical_date:
         print(f"\n{section_div(f' FULL ANALYSIS (HISTORICAL): {symbol} @ {historical_date} ')}")
     else:
         print(f"\n{section_div(f' FULL ANALYSIS: {symbol} ')}")
-    print(f"{'  [DeepSeek V4 Pro] 实时数据 + LLM 深度分析' if not use_mock else '  [Mock] 本地启发式分析（不调用 LLM）'}")
-    print(f"{'  [三线时间维度] 短线/中线/长线 同步分析' if not use_mock else '  [三线时间维度] Mock 模式'}")
+    print(f"  分析模式: {mode_label} | 管线: {pipeline_label}")
 
     # 1. 数据
-    print(f"\n  [1/5] Fetching data...")
+    print(f"\n  [STAGE:1/5] 数据获取 — 正在拉取行情、技术指标、新闻、财务数据...", flush=True)
     if historical_date:
         data = get_historical_snapshot(symbol, str(historical_date), market)
     else:
         data = get_compressed_data(symbol, market)
 
-    # 2. Agent
-    print(f"\n  [2/5] Running agent analysis...")
+    # 2. Agent (提取结构化数据)
+    print(f"\n  [STAGE:2/5] 多Agent结构化数据提取 — LLM提取技术面/基本面/情绪面/宏观面数据...", flush=True)
     reports = run_all_agents(data, use_mock=use_mock)
 
-    # 3. 三线时间观点（NEW）
-    print(f"\n  [3/5] Running time-frame analysis (short/mid/long)...")
-    time_opinions = run_time_frame_agents(data, reports, use_mock=use_mock)
+    # 3. 三线时间评估 + 辩论 (辩论仅用于全LLM管线，因子模式跳过)
+    if use_llm_pipeline:
+        print(f"\n  [STAGE:3/5] 三线时间维度评估 + 多空辩论...", flush=True)
+        time_opinions = run_time_frame_agents(data, reports, use_mock=use_mock)
+        debate = run_debate(reports, use_mock=use_mock, time_frame_opinions=time_opinions)
+    else:
+        print(f"\n  [STAGE:3/5] 三线时间维度评估 (跳过辩论，因子模型无需多空辩论)...", flush=True)
+        time_opinions = run_time_frame_agents(data, reports, use_mock=use_mock)
+        debate = {
+            "moderation": {"bull_score": 0.5, "bear_score": 0.5, "winner": "N/A"},
+            "leaning_short": 0.5, "leaning_mid": 0.5, "leaning_long": 0.5,
+            "all_rounds_text": "因子模型模式，跳过辩论",
+            "rounds": [],
+        }
 
-    # 4. 辩论（注入三线观点）
-    print(f"\n  [4/5] Running bull-bear debate (with time-frame context)...")
-    debate = run_debate(reports, use_mock=use_mock, time_frame_opinions=time_opinions)
-
-    # 5. 决策（注入持仓上下文+三线观点）
-    print(f"\n  [5/5] Synthesizing final decision (3D)...")
+    # 4. 持仓上下文
     portfolio_context = None
     portfolio_summary = None
-    exit_advices = []
-
     if use_portfolio:
         from portfolio.manager import load_portfolio, get_portfolio_summary
         pf = load_portfolio()
-        # 获取持仓股票的当前价格用于汇总
-        held_prices = {}
-        held_symbols = [p["symbol"] for p in pf.get("positions", [])]
-        if held_symbols and held_symbols[0] != symbol:
-            # 如果分析的不是持仓股，仍需要持仓股的价格用于汇总
-            pass
         ps = get_portfolio_summary({symbol: float(data.get("quote", {}).get("price", 0) or 0)})
         portfolio_summary = ps
-
-        total_mv = ps["market_value"]
         total = ps["total_assets"]
-        position_used_pct = (total_mv / total * 100) if total > 0 else 0
-
+        total_mv = ps["market_value"]
         portfolio_context = {
             "total_assets": total,
             "cash": ps["cash"],
-            "position_used_pct": position_used_pct,
+            "position_used_pct": (total_mv / total * 100) if total > 0 else 0,
             "holdings": [{
                 "symbol": p["symbol"],
                 "name": p.get("name", ""),
@@ -608,14 +606,53 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
             } for p in ps["positions"]],
         }
 
-    decision = make_decision(data, reports, debate, use_mock=use_mock,
-                             portfolio_context=portfolio_context,
-                             time_frame_opinions=time_opinions,
-                             adapted_params=adapted_params)
+    # 5. 决策 — 默认因子模型，可选全LLM管线
+    print(f"\n  [STAGE:4/5] 生成交易决策...", flush=True)
 
+    if use_llm_pipeline:
+        # 旧版全LLM管线 (Agent→辩论→LLM综合决策)
+        print(f"  [决策引擎] LLM综合决策 (synthesis_3d_agent)")
+        decision = make_decision(data, reports, debate, use_mock=use_mock,
+                                 portfolio_context=portfolio_context,
+                                 time_frame_opinions=time_opinions,
+                                 adapted_params=adapted_params)
+        llm_review = None
+    else:
+        # 量化基金架构: 因子模型生成信号
+        print(f"  [决策引擎] 因子模型统计引擎 (generate_3d_factor_signals)")
+        decision = generate_3d_factor_signals(symbol, data, portfolio_context)
+
+        # LLM 复核层 (仅在因子评分临界区 50-65 时调用)
+        print(f"\n  [STAGE:5/5] LLM复核层检查...", flush=True)
+        llm_review = None
+        for tf_key in ["short_term", "mid_term", "long_term"]:
+            tf_decision = decision.get(tf_key, {})
+            score = tf_decision.get("_factor_score", 50)
+            if 50 <= score <= 65:
+                try:
+                    from agents.prompts import ALL_PROMPTS
+                    from data.deepseek import deepseek_chat
+                    from agents.runner import format_technical_context
+                    ctx = format_technical_context(data)
+                    prompt_3d = ALL_PROMPTS.get("synthesis_3d_agent", "")
+                    factor_ctx = f"{ctx}\n\n[因子模型评分]\n"
+                    for tf2 in ["short_term", "mid_term", "long_term"]:
+                        d = decision.get(tf2, {})
+                        factor_ctx += f"{tf2}: 评分={d.get('_factor_score','?')}/100 信号={d.get('action','?')}\n"
+                    factor_ctx += "\n你是复核层。只有发现因子模型忽略的重大风险才能否决买入(VETO)，不能主动发起买入。"
+                    raw = deepseek_chat(prompt_3d, factor_ctx, max_tokens=1024, timeout=30)
+                    llm_review = {"raw": raw, "note": "LLM复核层，仅可否决不可主动买入"}
+                    print(f"  LLM复核: {raw[:150]}...")
+                except Exception as e:
+                    llm_review = {"error": str(e)}
+                    print(f"  LLM复核失败: {e}")
+                break  # 只复核一次
+
+    # 显示决策
     print(f"\n{section_div(' 三维决策 · 最终交易方案 ')}")
+    driver_label = "因子模型" if not use_llm_pipeline else "LLM综合"
+    print(f"  决策引擎: {driver_label} | 复核: {'LLM' if llm_review else '无(评分明确)'}")
 
-    # 三维决策显示
     for dim_key, dim_label in [("short_term", "短线"), ("mid_term", "中线"), ("long_term", "长线")]:
         dim = decision.get(dim_key, {})
         if not dim: continue
@@ -625,15 +662,18 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         d_take = format_price(dim.get('take_profit_price'))
         d_pos = f"{dim.get('position_pct', 0)}%"
         d_conf = f"{dim.get('confidence', 0):.0%}"
-        d_rationale = dim.get('rationale', '')[:100]
+        d_rationale = str(dim.get('rationale', ''))[:100]
         pm = dim.get("potential_multiplier", "")
         d_expected = dim.get("expected_return_pct", 0)
         d_exit = dim.get("exit_strategy", {})
+        factor_score = dim.get("_factor_score", None)
 
         print(card_header(f" {dim_label} ", width=HALF_W))
         print(card_dual("Action", d_action, "Pos", d_pos, width=HALF_W))
         print(card_dual("Entry", d_entry, "Stop", d_stop, width=HALF_W))
         print(card_dual("Conf", d_conf, "Exp.Ret", f"{d_expected}%", width=HALF_W))
+        if factor_score is not None:
+            print(card_line(f"因子评分: {factor_score:.0f}/100", width=HALF_W))
         if pm:
             print(card_line(f"潜力: {pm}", width=HALF_W))
         print(card_line(f"{d_rationale}", width=HALF_W))
@@ -642,7 +682,6 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         print(card_bottom(width=HALF_W))
     print(card_empty())
 
-    # 综合
     verdict = decision.get('overall_verdict', '')
     print(card_line(f"综合裁决: {verdict}"))
     print(card_bottom())
@@ -657,12 +696,14 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         "debate_result": debate,
         "final_decision": decision,
         "adapted_params": adapted_params,
+        "llm_review": llm_review,
+        "_decision_engine": "factor_model" if not use_llm_pipeline else "llm_pipeline",
     }
 
     if portfolio_summary:
         result["portfolio_summary"] = portfolio_summary
 
-    # 5. 单票持仓退出建议 + 动态持仓管理
+    # 单票持仓退出建议 + 动态持仓管理
     if position and isinstance(position, dict):
         from analysis.exit_strategy import assess_exit
         from analysis.holding import evaluate_holding
@@ -676,7 +717,6 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         exit_advice = assess_exit(symbol, entry_price, quantity, current_price, data)
         result["exit_advice"] = exit_advice
 
-        # 动态持仓评估
         holding_eval = evaluate_holding(symbol, entry_price, current_price, quantity,
                                         timeframe, data)
         result["holding_evaluation"] = holding_eval
@@ -692,7 +732,6 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
             print(card_line(f"  - {reason}"))
         print(card_bottom())
 
-        # 显示动态持仓管理
         print(f"\n{section_div(' DYNAMIC HOLDING MANAGEMENT ')}")
         print(card_dual("Holding Action", holding_eval['action'], "Ratio", f"{holding_eval['ratio']}%"))
         print(card_field("Profit", f"{holding_eval['profit_pct']:+.2f}%"))

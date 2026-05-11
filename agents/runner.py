@@ -52,6 +52,8 @@ def format_fundamental_context(data: dict) -> str:
     q = data.get("quote", {})
     f = data.get("financial", {})
     news = data.get("news", [])
+    if not isinstance(news, list):
+        news = list(news.values()) if isinstance(news, dict) else []
 
     # 新闻可能是字符串列表或字典列表
     def _news_title(n):
@@ -83,6 +85,8 @@ def format_fundamental_context(data: dict) -> str:
 def format_sentiment_context(data: dict) -> str:
     """将新闻标题列表转为情绪分析师的文本输入。"""
     news = data.get("news", [])
+    if not isinstance(news, list):
+        news = list(news.values()) if isinstance(news, dict) else []
     if not news:
         return "（无新闻数据）"
     lines = ["以下是与该股票相关的近期新闻标题：", ""]
@@ -296,10 +300,10 @@ def _call_llm_agent(agent_name: str, system_prompt: str, context_text: str,
 
     prompt_filled = system_prompt.replace("{{context}}", context_text)
     try:
-        raw = DeepSeekClient().chat(prompt_filled, "请输出JSON分析结果。")
+        raw = DeepSeekClient().chat(prompt_filled, "请输出JSON分析结果。", timeout=30)
         return _parse_agent_json(raw, agent_name)
     except Exception as e:
-        print(f"  [WARN] {agent_name} API调用失败: {e}，回退到本地推断")
+        print(f"  [WARN] {agent_name} 分析超时/失败: {e}，使用本地启发式替代")
         return _mock_agent_response(agent_name, context_text)
 
 
@@ -322,8 +326,8 @@ def _parse_agent_json(raw_text: str, agent_name: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # 尝试找 {} 包裹的 JSON
-    match = re.search(r'\{[^{}]*"signal"[^{}]*\}', clean)
+    # 尝试找任意 {} 包裹的 JSON
+    match = re.search(r'\{.*\}', clean, re.DOTALL)
     if match:
         try:
             result = json.loads(match.group(0))
@@ -331,12 +335,10 @@ def _parse_agent_json(raw_text: str, agent_name: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # 降级：返回默认值，reasoning 保留原始回复前100字
+    # 降级：返回默认结构化数据，reasoning 保留原始回复前100字
     return {
         "agent": agent_name,
         "type": "LLM",
-        "signal": "HOLD",
-        "score": 0,
         "confidence": 0.30,
         "reasoning": clean[:100],
         "parse_error": True,
@@ -344,19 +346,44 @@ def _parse_agent_json(raw_text: str, agent_name: str) -> dict:
 
 
 def _validate_agent_result(result: dict, agent_name: str) -> dict:
-    """校验并补全 Agent 输出字段。"""
+    """校验并补全 Agent 输出字段。兼容新旧两种格式。
+
+    新格式(量化基金): agent 输出结构化数据(trend_strength/valuation_score等)
+    旧格式(legacy): agent 输出 BUY/SELL 信号 — 仍兼容但标记为 legacy
+    """
     result["agent"] = agent_name
-    result["type"] = "LLM"
-    signal = str(result.get("signal", "HOLD")).upper().strip()
-    result["signal"] = signal if signal in ("BUY", "SELL", "HOLD", "CAUTIOUS_BUY", "CAUTIOUS_SELL") else "HOLD"
-    try:
-        result["score"] = max(-10, min(10, int(result.get("score", 0))))
-    except (ValueError, TypeError):
-        result["score"] = 0
+    result["type"] = "LLM(DeepSeek V4)"
+
+    # 判断新旧格式
+    has_structured = any(k in result for k in (
+        "trend_strength", "valuation_score", "sentiment_score_raw", "market_regime",
+        "momentum_score", "trend_quality_score", "growth_potential_score"
+    ))
+    has_signal = "signal" in result
+
+    if has_structured:
+        result["type"] = "LLM(DeepSeek V4) — 结构化数据"
+        # 从结构化字段推断置信度
+        if "confidence" not in result:
+            result["confidence"] = 0.7
+    elif has_signal:
+        # 旧格式兼容: 保留信号但标记来源
+        result["type"] = "LLM(DeepSeek V4) — Legacy信号(兼容)"
+        signal = str(result.get("signal", "HOLD")).upper().strip()
+        result["signal"] = signal if signal in ("BUY", "SELL", "HOLD", "CAUTIOUS_BUY", "CAUTIOUS_SELL") else "HOLD"
+        try:
+            result["score"] = max(-10, min(10, int(result.get("score", 0))))
+        except (ValueError, TypeError):
+            result["score"] = 0
+    else:
+        result["type"] = "LLM(DeepSeek V4) — 解析失败"
+        result["confidence"] = 0.30
+
     try:
         result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.5))))
     except (ValueError, TypeError):
         result["confidence"] = 0.5
+
     result["reasoning"] = str(result.get("reasoning", ""))[:120]
     return result
 
@@ -366,20 +393,23 @@ def _validate_agent_result(result: dict, agent_name: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _mock_agent_response(agent_name: str, context_text: str) -> dict:
-    """基于实际数据的启发式分析，模拟 LLM 输出格式。"""
+    """基于实际数据的启发式分析，输出结构化数据格式（与LLM新Prompt一致）。"""
     if agent_name == "technical_analyst":
-        return _mock_technical(context_text)
+        result = _mock_technical(context_text)
     elif agent_name == "fundamental_analyst":
-        return _mock_fundamental(context_text)
+        result = _mock_fundamental(context_text)
     elif agent_name == "sentiment_analyst":
-        return _mock_sentiment(context_text)
+        result = _mock_sentiment(context_text)
     elif agent_name == "macro_analyst":
-        return _mock_macro(context_text)
-    return {
-        "agent": agent_name, "type": "Mock",
-        "signal": "HOLD", "score": 0, "confidence": 0.30,
-        "reasoning": "Mock回退：无法生成分析。"
-    }
+        result = _mock_macro(context_text)
+    else:
+        result = {
+            "agent": agent_name, "type": "Mock(启发式)",
+            "confidence": 0.30,
+            "reasoning": "无法生成分析。"
+        }
+    result["source"] = "fallback"
+    return result
 
 
 def _parse_value(text, key):
@@ -395,76 +425,72 @@ def _parse_value(text, key):
 
 
 def _mock_technical(ctx: str) -> dict:
+    """启发式技术面评估 → 结构化数据格式 (不输出BUY/SELL)。"""
     price = _parse_value(ctx, "最新价")
     ma5 = _parse_value(ctx, "MA5")
     ma20 = _parse_value(ctx, "MA20")
     rsi = _parse_value(ctx, r"RSI\(14\)")
     macd_hist = _parse_value(ctx, "柱")
-    # 解析布林带位置文本
+    turnover = _parse_value(ctx, "换手率")
     boll_info = ""
     m = re.search(r'价格在布林带位置:\s*(.+)$', ctx, re.MULTILINE)
     if m:
         boll_info = m.group(1)
 
-    score = 0
+    # 趋势强度
+    trend_strength = 0
     signals = []
-    confidence = 0.55
-
-    # MA判断
     if ma5 and ma20 and price:
         if ma5 > ma20:
-            score += 3; signals.append("MA5>MA20多头排列")
+            trend_strength += 3; signals.append("MA5>MA20多头排列")
         else:
-            score -= 3; signals.append("MA5<MA20空头排列")
+            trend_strength -= 3; signals.append("MA5<MA20空头排列")
 
-    # RSI判断
+    # RSI 区间
+    rsi_zone = "neutral"
     if rsi is not None:
-        if rsi < 25:
-            score += 4; signals.append(f"RSI={rsi}深度超卖，反弹概率大")
-            confidence += 0.10
-        elif rsi < 35:
-            score += 2; signals.append(f"RSI={rsi}超卖区域")
-            confidence += 0.05
-        elif rsi > 80:
-            score -= 4; signals.append(f"RSI={rsi}极度超买，回调风险")
-            confidence += 0.10
-        elif rsi > 70:
-            score -= 2; signals.append(f"RSI={rsi}超买区域")
-        else:
-            signals.append(f"RSI={rsi}正常区间")
+        if rsi < 30: rsi_zone = "oversold"
+        elif rsi > 70: rsi_zone = "overbought"
 
-    # MACD柱判断
+    # MACD
+    macd_signal = "none"
     if macd_hist is not None:
-        if macd_hist > 0:
-            score += 1; signals.append("MACD柱翻红")
-        else:
-            score -= 1; signals.append("MACD柱翻绿")
+        macd_signal = "bullish" if macd_hist > 0 else "bearish"
+
+    # 成交量
+    volume_assessment = "normal"
+    if turnover is not None:
+        if turnover > 5: volume_assessment = "active"
+        elif turnover < 1: volume_assessment = "weak"
 
     # 布林带位置
+    boll_position = "within"
     if "跌破下轨" in boll_info or "下轨区间" in boll_info:
-        if rsi and rsi < 35:
-            score += 2; signals.append("布林下轨+RSI超卖=潜在反弹点")
-        else:
-            signals.append(boll_info)
-    elif "突破上轨" in boll_info:
-        score -= 2; signals.append(boll_info)
+        boll_position = "below"
+    elif "突破上轨" in boll_info or "上轨区间" in boll_info:
+        boll_position = "above"
 
-    score = max(-10, min(10, score))
-    if score >= 4:
-        sig = "BUY"
-    elif score <= -4:
-        sig = "SELL"
-    else:
-        sig = "HOLD"
-
+    trend_strength = max(-10, min(10, trend_strength))
     return {
         "agent": "technical_analyst", "type": "Mock(启发式)",
-        "signal": sig, "score": score, "confidence": round(confidence, 2),
-        "reasoning": "；".join(signals[:3])[:120]
+        "trend_strength": trend_strength,
+        "trend_direction": "up" if trend_strength > 2 else ("down" if trend_strength < -2 else "sideways"),
+        "rsi_reading": rsi,
+        "rsi_zone": rsi_zone,
+        "macd_signal": macd_signal,
+        "volume_assessment": volume_assessment,
+        "support_distance_pct": 3.0 if boll_position == "below" else -2.0,
+        "resistance_distance_pct": -3.0 if boll_position == "above" else 2.0,
+        "bollinger_position": boll_position + "_band" if boll_position in ("above", "below") else "within",
+        "breakout_active": False,
+        "technical_risks": [],
+        "confidence": 0.55,
+        "reasoning": "；".join(signals[:3])[:120] if signals else "技术面数据解析完成"
     }
 
 
 def _mock_fundamental(ctx: str) -> dict:
+    """启发式基本面评估 → 结构化数据格式 (不输出BUY/SELL)。"""
     pe = _parse_value(ctx, r"PE\(市盈率\)")
     pb = _parse_value(ctx, r"PB\(市净率\)")
     roe = _parse_value(ctx, r"ROE\(净资产收益率\)")
@@ -472,147 +498,131 @@ def _mock_fundamental(ctx: str) -> dict:
     rev_growth = _parse_value(ctx, "营收增长率")
     debt = _parse_value(ctx, "资产负债率")
 
-    score = 0
+    valuation_score = 0
+    growth_score = 0
+    health_score = 0
     signals = []
-    confidence = 0.50
+    risk_flags = []
 
     if pe is not None:
-        if pe < 10:
-            score += 3; signals.append(f"PE={pe}极低估值")
-        elif pe < 20:
-            score += 1; signals.append(f"PE={pe}偏低估值")
-        elif pe <= 35:
-            signals.append(f"PE={pe}合理区间")
-        elif pe <= 50:
-            score -= 1; signals.append(f"PE={pe}偏高估值")
-        else:
-            score -= 3; signals.append(f"PE={pe}高估值")
+        if pe < 10: valuation_score += 3; signals.append(f"PE={pe}极低估值")
+        elif pe < 20: valuation_score += 1
+        elif pe > 50: valuation_score -= 3; signals.append(f"PE={pe}高估值")
 
     if pb is not None:
-        if pb < 0.8:
-            score += 3; signals.append(f"PB={pb}破净，硬资产保底")
-        elif pb < 2:
-            score += 1; signals.append(f"PB={pb}合理偏低")
-        elif pb <= 8:
-            signals.append(f"PB={pb}中等水平")
-        else:
-            score -= 2; signals.append(f"PB={pb}偏高")
+        if pb < 0.8: valuation_score += 3; signals.append(f"PB={pb}破净")
+        elif pb > 8: valuation_score -= 2
 
     if roe is not None:
-        if roe > 25:
-            score += 3; signals.append(f"ROE={roe}%极优秀")
-            confidence += 0.10
-        elif roe > 15:
-            score += 2; signals.append(f"ROE={roe}%优秀")
-        elif roe < 5:
-            score -= 2; signals.append(f"ROE={roe}%偏低")
+        if roe > 25: growth_score += 3
+        elif roe > 15: growth_score += 2
+        elif roe < 5: growth_score -= 2; risk_flags.append(f"ROE={roe}%偏低")
 
     if np_growth is not None:
-        if np_growth > 20:
-            score += 2; signals.append(f"净利润增速{np_growth}%高增长")
-        elif np_growth < 0:
-            score -= 3; signals.append(f"净利润增速{np_growth}%负增长")
+        if np_growth > 20: growth_score += 2
+        elif np_growth < 0: growth_score -= 3; risk_flags.append("净利润负增长")
 
-    # ── 资产负债率硬规则 ──
-    debt_override = None  # 强制信号覆盖
+    # 负债率
+    debt_warning = False
+    debt_severity = "safe"
     if debt is not None:
         if debt > 85:
-            score -= 6
-            confidence += 0.15
-            # 根据其他指标决定是 CAUTIOUS_BUY 还是 CAUTIOUS_SELL
-            if score >= 3:
-                debt_override = "CAUTIOUS_BUY"
-                signals.append(f"负债率{debt}%>85%严重高杠杆，仅适合短线轻仓")
-            else:
-                debt_override = "CAUTIOUS_SELL"
-                signals.append(f"负债率{debt}%>85%严重高杠杆，风险恶化建议减仓")
-        elif debt > 80:
-            score -= 4
-            debt_override = "HOLD"
-            signals.append(f"负债率{debt}%>80%高风险杠杆，禁止看多")
-            confidence += 0.05
+            health_score -= 6; debt_warning = True; debt_severity = "danger"
+            risk_flags.append(f"负债率{debt}%>85%严重高杠杆")
         elif debt > 70:
-            score -= 1
-            signals.append(f"负债率{debt}%偏高")
+            health_score -= 2; debt_warning = True; debt_severity = "caution"
+            risk_flags.append(f"负债率{debt}%偏高")
+        elif debt > 50:
+            health_score -= 1
 
-    # ── ROE < 3% 极端情况 ──
-    if roe is not None and roe < 3 and debt_override is None:
-        score -= 3
-        confidence += 0.10
-        if score >= 3:
-            debt_override = "CAUTIOUS_BUY"
-            signals.append(f"ROE={roe}%<3%盈利能力极弱，仅适合短线轻仓")
-        elif score <= -3:
-            debt_override = "CAUTIOUS_SELL"
-            signals.append(f"ROE={roe}%<3%盈利能力极弱，风险恶化建议减仓")
-
-    score = max(-10, min(10, score))
-    if debt_override:
-        sig = debt_override
-    elif score >= 3:
-        sig = "BUY"
-    elif score <= -3:
-        sig = "SELL"
-    else:
-        sig = "HOLD"
-
-    if not signals:
-        signals.append(f"PE={pe}, PB={pb}, ROE={roe} | 基本面数据部分缺失，默认中性判断")
+    roe_quality = "excellent" if (roe and roe > 20) else ("good" if (roe and roe > 15) else ("fair" if (roe and roe > 5) else "weak"))
 
     return {
         "agent": "fundamental_analyst", "type": "Mock(启发式)",
-        "signal": sig, "score": score, "confidence": round(confidence, 2),
-        "reasoning": "；".join(signals[:4])[:120]
+        "valuation_score": max(-10, min(10, valuation_score)),
+        "growth_score": max(-10, min(10, growth_score)),
+        "financial_health_score": max(-10, min(10, health_score)),
+        "pe_assessment": "undervalued" if (pe and pe < 10) else ("overvalued" if (pe and pe > 50) else "fair"),
+        "pb_assessment": "undervalued" if (pb and pb < 0.8) else "fair",
+        "roe_quality": roe_quality,
+        "debt_warning": debt_warning,
+        "debt_severity": debt_severity,
+        "earnings_momentum": "accelerating" if (np_growth and np_growth > 20) else ("declining" if (np_growth and np_growth < 0) else "stable"),
+        "risk_flags": risk_flags,
+        "confidence": 0.55,
+        "reasoning": "；".join(signals[:3])[:120] if signals else "基本面数据解析完成"
     }
 
 
 def _mock_sentiment(ctx: str) -> dict:
+    """启发式新闻情绪评估 → 结构化数据格式."""
+    # 无新闻数据时返回中性评分
+    if "无新闻数据" in ctx:
+        return {
+            "agent": "sentiment_analyst", "type": "Mock(启发式·无数据)",
+            "sentiment_score": 0,
+            "impact_level": "low",
+            "positive_count": 0, "negative_count": 0,
+            "positive_themes": [], "negative_themes": [],
+            "sentiment_trend": "stable",
+            "extreme_warning": False,
+            "confidence": 0.35,
+            "reasoning": "新闻数据不可用，情绪评分中性"
+        }
+
     positive_kw = ['增长', '突破', '回购', '中标', '签约', '增持', '买入', '利好',
                    '上涨', '新高', '分红', '盈利', '获奖', '通过', '获批', '超预期']
     negative_kw = ['下滑', '亏损', '处罚', '调查', '减持', '卖出', '跌停', '利空',
                    '下跌', '新低', '违规', '退市', '破产', '暴雷', '造假', '问询']
 
     lines = ctx.split('\n')
-    pos_count = 0
-    neg_count = 0
+    pos_count = 0; neg_count = 0
+    pos_themes = []; neg_themes = []
     for line in lines:
         if not line.strip().startswith('['):
             continue
         for kw in positive_kw:
             if kw in line:
-                pos_count += 1
+                pos_count += 1; pos_themes.append(kw)
                 break
         else:
             for kw in negative_kw:
                 if kw in line:
-                    neg_count += 1
+                    neg_count += 1; neg_themes.append(kw)
                     break
 
     total = max(pos_count + neg_count, 1)
     pos_ratio = pos_count / total
-
-    if pos_ratio >= 0.7:
-        sig, score = "BUY", 4
-        reasoning = f"{pos_count}条利好 vs {neg_count}条利空，情绪偏正面"
-    elif pos_ratio <= 0.3:
-        sig, score = "SELL", -4
-        reasoning = f"{pos_count}条利好 vs {neg_count}条利空，情绪偏负面"
-    else:
-        sig, score = "HOLD", 0
-        reasoning = f"利好{pos_count}条/利空{neg_count}条，多空交织情绪中性"
+    sentiment = round((pos_ratio - 0.5) * 20)
+    trend = "improving" if pos_ratio > 0.6 else ("deteriorating" if pos_ratio < 0.4 else "stable")
 
     return {
         "agent": "sentiment_analyst", "type": "Mock(启发式)",
-        "signal": sig, "score": score, "confidence": 0.55,
-        "reasoning": reasoning
+        "sentiment_score": max(-10, min(10, sentiment)),
+        "impact_level": "high" if abs(sentiment) >= 6 else ("medium" if abs(sentiment) >= 3 else "low"),
+        "positive_count": pos_count,
+        "negative_count": neg_count,
+        "positive_themes": list(set(pos_themes))[:3],
+        "negative_themes": list(set(neg_themes))[:3],
+        "sentiment_trend": trend,
+        "extreme_warning": pos_count + neg_count > 0 and (pos_ratio >= 0.8 or pos_ratio <= 0.2),
+        "confidence": 0.55,
+        "reasoning": f"{pos_count}条利好 vs {neg_count}条利空，情绪{'偏正面' if sentiment>2 else ('偏负面' if sentiment<-2 else '中性')}"
     }
 
 
 def _mock_macro(ctx: str) -> dict:
+    """启发式宏观评估 → 结构化数据格式."""
     return {
         "agent": "macro_analyst", "type": "Mock(推断)",
-        "signal": "HOLD", "score": 1, "confidence": 0.35,
-        "reasoning": "宏观数据占位符阶段。基于2026年A股震荡修复+货币宽松预期+CPI低位背景，整体中性偏正面。注意：非实时数据推断。"
+        "market_regime": "SIDEWAYS",
+        "liquidity_score": 2,
+        "policy_stance": "supportive",
+        "sector_tailwind": False,
+        "position_cap_pct": 25,
+        "macro_risks": ["宏观数据占位符阶段"],
+        "confidence": 0.35,
+        "reasoning": "基于2026年A股震荡修复+货币宽松预期+CPI低位背景推断，非实时数据。"
     }
 
 
@@ -622,15 +632,33 @@ def _mock_macro(ctx: str) -> dict:
 
 def run_all_agents(compressed_data: dict, use_mock: bool = False) -> list[dict]:
     """
-    主入口：运行全部 5 个 Agent，返回报告列表。
+    主入口：运行全部 4 个 LLM Agent + 1 个本地风控，返回结构化数据报告列表。
+
+    量化基金架构: Agent 提取结构化数据（趋势强度、估值评分、情绪评分等），
+    最终买卖决策由因子模型 generate_3d_factor_signals 生成。
 
     Args:
         compressed_data: data_pipeline.py 输出的压缩 JSON
         use_mock: True=用启发式规则模拟LLM，False=调用DeepSeek API
+                  受 ALLOW_MOCK 环境变量控制（默认 false，即必须实调 API）
 
     Returns:
-        list[dict]: 5个Agent的分析报告
+        list[dict]: 5个Agent的分析报告（结构化数据格式）
     """
+    # 环境变量控制: ALLOW_MOCK=false 时强制实调 API
+    import os as _os
+    _allow_mock_env = _os.environ.get("ALLOW_MOCK", "false").lower() in ("true", "1", "yes")
+    if not _allow_mock_env and use_mock:
+        print("  [MODE] ALLOW_MOCK=false，强制切换为 DeepSeek V4 Pro 实调模式")
+        use_mock = False
+
+    api_mode = "Mock模拟(本地启发式)" if use_mock else "DeepSeek V4 Pro 实调"
+    print(f"\n  {'='*60}")
+    print(f"  当前分析模式: {api_mode}")
+    print(f"  Agent 角色: 结构化数据提取 (不输出 BUY/SELL)")
+    print(f"  最终决策: 因子模型统计引擎")
+    print(f"  {'='*60}")
+
     agents_config = [
         ("technical_analyst", AGENT_PROMPTS["technical_analyst"],
          format_technical_context(compressed_data)),
@@ -645,17 +673,18 @@ def run_all_agents(compressed_data: dict, use_mock: bool = False) -> list[dict]:
     reports = []
 
     for name, prompt, context in agents_config:
-        mode_tag = "Mock(启发式)" if use_mock else "LLM(DeepSeek V4)"
+        mode_tag = "Mock(启发式)" if use_mock else "DeepSeek V4 Pro"
         print(f"\n{card_header(f'[{name}] ' + mode_tag)}")
-        print(f"{card_line('Analyzing...')}")
+        print(f"{card_line('Extracting structured data...')}")
         print(f"{card_bottom()}")
 
         report = _call_llm_agent(name, prompt, context, use_mock=use_mock)
         reports.append(report)
 
-        print(f"  {format_signal(report['signal'])} | Score: {report['score']:+d} | "
-              f"Conf: {report['confidence']:.0%} | Type: {report.get('type','?')}")
-        reasoning = report.get('reasoning', '')[:100]
+        # 显示提取的结构化数据摘要
+        rtype = report.get('type', '?')
+        print(f"  Type: {rtype} | Confidence: {report.get('confidence', 0):.0%}")
+        reasoning = str(report.get('reasoning', ''))[:100]
         if reasoning:
             print(f"  {reasoning}")
 
@@ -953,6 +982,8 @@ def extract_news_sentiment(compressed_data: dict, use_mock: bool = True) -> dict
         {"sentiment_score": -5~+5, "key_events": [...], "impact_score": 0~10}
     """
     news = compressed_data.get("news", [])
+    if not isinstance(news, list):
+        news = list(news.values()) if isinstance(news, dict) else []
     if not news:
         return {"sentiment_score": 0, "key_events": [], "impact_score": 0}
 
