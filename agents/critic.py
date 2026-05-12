@@ -237,7 +237,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
                      if time_opinions.get(tf, {}).get("signal") == "HOLD"]
         if not buy_dims:
             conservative_flaws.append("三线均无BUY信号，系统过于保守")
-            must_fix.append("time_frame_runner.py:'score >= 6' → 'score >= 5' 降低三线BUY阈值")
+            must_fix.append("agents/decision.py:'score >= 6' → 'score >= 5' 降低三线BUY阈值")
         if len(buy_dims) >= 2:
             aggressive_flaws.append(f"{len(buy_dims)}个时间维度同时看多，注意追高风险")
 
@@ -258,7 +258,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
                 min_pos = {"short_term": 8, "mid_term": 12, "long_term": 18}
                 if pos < min_pos.get(dim, 10):
                     conservative_flaws.append(f"{dim}仓位{pos}%偏小，应≥{min_pos[dim]}%")
-                    must_fix.append(f"decision_engine.py:'\"position_pct\": {pos}' → '\"position_pct\": {min_pos[dim]}' 提高{dim}仓位")
+                    must_fix.append(f"agents/decision.py:'\"position_pct\": {pos}' → '\"position_pct\": {min_pos[dim]}' 提高{dim}仓位")
 
                 # 风险收益比检查（target可能为None-动态退出模式）
                 if entry and entry > 0 and stop and stop > 0 and target and target > 0:
@@ -292,7 +292,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
                     aggressive_flaws.append(f"短线止损{s_stop_pct:.1f}%过宽，单笔亏损过大")
                 if l_stop_pct < 10:
                     conservative_flaws.append(f"长线止损{l_stop_pct:.1f}%过窄，不给成长空间")
-                    must_fix.append("decision_engine.py:'0.85' → '0.75' 放宽长线止损")
+                    must_fix.append("agents/decision.py:'0.85' → '0.75' 放宽长线止损")
 
         # ── 5. 长线成长潜力检查 ──
         long_tf = time_opinions.get("long_term", {})
@@ -333,13 +333,13 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
                         f"{dim_label}BUY信号但预期收益{expected}%<目标{dim_target}%，差距{dim_target - expected}%→扣3分"
                     )
                     must_fix.append(
-                        f"agent_prompts.py: {dim_label.upper()}_TERM_PROMPT应提高{dim_label}预期收益目标，当前{expected}%不足{dim_target}%"
+                        f"agents/prompts.py: {dim_label.upper()}_TERM_PROMPT应提高{dim_label}预期收益目标，当前{expected}%不足{dim_target}%"
                     )
                 if dim_key == "long_term" and not doubling_logic:
                     can_hit_target["long"]["has_doubling_logic"] = False
                     can_hit_target["long"]["ok"] = False
                     conservative_flaws.append("长线BUY但无翻倍逻辑(doubling_logic)，未给出2倍以上路径→扣3分")
-                    must_fix.append("agent_prompts.py: LONG_TERM_PROMPT必须要求输出doubling_logic翻倍路径")
+                    must_fix.append("agents/prompts.py: LONG_TERM_PROMPT必须要求输出doubling_logic翻倍路径")
                 elif dim_key == "long_term" and doubling_logic:
                     can_hit_target["long"]["has_doubling_logic"] = True
             elif action == "HOLD" and dim_key == "long_term" and not doubling_logic:
@@ -401,7 +401,7 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
             "can_hit_target": can_hit_target,
             "verdict": verdict_text,
             "must_fix": must_fix if must_fix else (
-                ["time_frame_runner.py:'score >= 6' → 'score >= 4' 进一步降低BUY阈值"]
+                ["agents/decision.py:'score >= 6' → 'score >= 4' 进一步降低BUY阈值"]
                 if conservative_flaws else []
             ),
             "score_breakdown": {
@@ -468,6 +468,244 @@ def critic_evaluate(symbol: str = "600519", market: str = "A",
     print()
 
     return result
+
+
+def _compress_backtest_context(metrics: dict, closed_trades: list, symbol: str,
+                                start_date: str, end_date: str) -> str:
+    """将回测结果压缩为精简摘要，避免 prompt 过长导致 API 超时。
+
+    只保留: 核心指标 + 最近10笔交易明细 + 三线达成率。
+    删除: 逐日权益曲线、重复的开仓/平仓计数、原始 trade_log 全量。
+    """
+    lines = [
+        f"标的:{symbol} 区间:{start_date}→{end_date}",
+        f"收益:{metrics.get('total_return_pct',0):+.2f}% 回撤:{metrics.get('max_drawdown_pct',0):.1f}% "
+        f"夏普:{metrics.get('sharpe_ratio',0):.2f} 胜率:{metrics.get('win_rate_pct',0):.1f}%",
+        f"交易:{metrics.get('total_trades',0)}笔(胜{metrics.get('win_trades',0)}/负{metrics.get('loss_trades',0)}) "
+        f"盈亏比:{metrics.get('profit_factor',0):.2f}",
+        f"三线达成:短{metrics.get('achievement_short',0):.0f}% 中{metrics.get('achievement_mid',0):.0f}% "
+        f"长{metrics.get('achievement_long',0):.0f}%",
+        f"三线收益:短{metrics.get('return_short',0):+.2f}% 中{metrics.get('return_mid',0):+.2f}% "
+        f"长{metrics.get('return_long',0):+.2f}%",
+    ]
+    if closed_trades:
+        lines.append(f"最近{min(10, len(closed_trades))}笔平仓:")
+        for t in closed_trades[-10:]:
+            lines.append(f"  {t['date']} {t['timeframe']} {t['action']} "
+                        f"PnL={t['pnl_pct']:+.2f}% 原因:{t.get('reason','')[:30]}")
+    return "\n".join(lines)
+
+
+def _heuristic_critique_fallback(metrics: dict, closed_trades: list) -> dict:
+    """本地启发式 Critic — 当 DeepSeek API 超时时降级使用。
+
+    保证至少产出 1 条有效修改指令。
+    """
+    must_fix = []
+    issues = []
+
+    total_return = metrics.get("total_return_pct", 0)
+    max_dd = metrics.get("max_drawdown_pct", 0)
+    win_rate = metrics.get("win_rate_pct", 0)
+    total_trades = metrics.get("total_trades", 0)
+
+    # 规则1: 胜率 < 20% → 下调 BUY 阈值 3 分
+    if win_rate < 20:
+        issues.append(f"胜率仅{win_rate:.0f}%过低，信号质量严重不足")
+        must_fix.append("factor_weights.json: short.threshold 降低3分以放宽入场")
+
+    # 规则2: 最大回撤 > 20% → 止损收紧 20%
+    if max_dd > 20:
+        issues.append(f"最大回撤{max_dd:.1f}%过大，风控失效")
+        must_fix.append("agents/decision.py: 止损宽度收紧20%，强化风险控制")
+
+    # 规则3: 交易次数 > 15 且胜率 < 30% → 减少仓位上限 10%
+    if total_trades > 15 and win_rate < 30:
+        issues.append(f"{total_trades}笔交易胜率仅{win_rate:.0f}%，频繁交易但质量差")
+        must_fix.append("agents/decision.py: 单线最大仓位上限减少10%")
+
+    # 规则4: 负收益 → 降低阈值
+    if total_return < 0 and not any("阈值" in f or "threshold" in f for f in must_fix):
+        issues.append(f"总收益{total_return:+.1f}%为负")
+        must_fix.append("factor_weights.json: 各线threshold降低2分以捕捉更多机会")
+
+    # 规则5: 交易过少
+    if total_trades < 3:
+        issues.append(f"仅{total_trades}笔交易，系统过于保守")
+        must_fix.append("factor_weights.json: short.threshold降低5分以增加交易频率")
+
+    # 保底: 确保至少有 1 条指令
+    if not must_fix:
+        if total_return < 20:
+            must_fix.append("factor_weights.json: short.threshold降低2分以提升进攻性")
+            issues.append(f"收益率{total_return:+.1f}%未达预期")
+        else:
+            must_fix.append("agents/decision.py: 动态止盈触发阈值提高5%以放大盈利")
+            issues.append("系统运行正常但止盈可能过早")
+
+    # 评分
+    score = 5
+    if total_return > 30 and win_rate > 40:
+        score = 7
+    elif total_return < -10 or win_rate < 15:
+        score = 2
+    elif total_return < 0:
+        score = 3
+
+    loss_trades = [t for t in closed_trades if t.get("pnl", 0) < 0]
+    if loss_trades:
+        avg_loss = sum(t["pnl_pct"] for t in loss_trades) / len(loss_trades)
+        lost_analysis = f"{len(loss_trades)}笔亏损，平均亏{avg_loss:+.1f}%"
+    else:
+        lost_analysis = "无亏损交易"
+
+    return {
+        "overall_score": score,
+        "main_issue": issues[0] if issues else "启发式分析完成",
+        "all_issues": issues,
+        "lost_trades_analysis": lost_analysis,
+        "target_achievement": {
+            "short": metrics.get("achievement_short", 0) >= 30,
+            "mid": metrics.get("achievement_mid", 0) >= 30,
+            "long": metrics.get("achievement_long", 0) >= 30,
+        },
+        "must_fix": must_fix[:4],
+        "score_breakdown": {
+            "return_quality": min(10, max(1, int(6 + total_return / 10))),
+            "risk_control": min(10, max(1, int(10 - max_dd / 5))),
+            "win_quality": min(10, max(1, int(win_rate / 10))),
+        },
+        "_source": "heuristic_fallback",
+    }
+
+
+def _generate_code_changes(metrics: dict, closed_trades: list) -> list:
+    """基于回测指标，读取实际文件，生成精确的 old_code → new_code 替换指令。"""
+    code_changes = []
+
+    total_return = metrics.get("total_return_pct", 0)
+    max_dd = metrics.get("max_drawdown_pct", 0)
+    win_rate = metrics.get("win_rate_pct", 0)
+    total_trades = metrics.get("total_trades", 0)
+
+    # 项目根目录
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # ── 1. factor_weights.json 阈值调整 ──
+    weights_path = os.path.join(project_root, "analysis", "factor_weights.json")
+    try:
+        with open(weights_path, 'r', encoding='utf-8') as f:
+            weights = json.load(f)
+    except Exception:
+        weights = None
+
+    if weights:
+        if win_rate < 20 and total_trades >= 3:
+            for tf in ["short", "mid", "long"]:
+                threshold = weights.get(tf, {}).get("threshold", 55)
+                new_threshold = max(40, threshold - 3)
+                if new_threshold != threshold:
+                    code_changes.append({
+                        "file": "analysis/factor_weights.json",
+                        "function": "",
+                        "old_code": f'"threshold": {threshold}',
+                        "new_code": f'"threshold": {new_threshold}',
+                        "reason": f"胜率仅{win_rate:.0f}%，降低{tf}线阈值{threshold}→{new_threshold}",
+                    })
+
+        if total_return < 0 and not any(c["file"] == "analysis/factor_weights.json" for c in code_changes):
+            for tf in ["short", "mid", "long"]:
+                threshold = weights.get(tf, {}).get("threshold", 55)
+                new_threshold = max(40, threshold - 2)
+                if new_threshold != threshold:
+                    code_changes.append({
+                        "file": "analysis/factor_weights.json",
+                        "function": "",
+                        "old_code": f'"threshold": {threshold}',
+                        "new_code": f'"threshold": {new_threshold}',
+                        "reason": f"负收益{total_return:+.1f}%，降低{tf}线阈值{threshold}→{new_threshold}",
+                    })
+
+        if total_trades < 3:
+            for tf in ["short", "mid"]:
+                threshold = weights.get(tf, {}).get("threshold", 55)
+                new_threshold = max(40, threshold - 5)
+                if new_threshold != threshold:
+                    code_changes.append({
+                        "file": "analysis/factor_weights.json",
+                        "function": "",
+                        "old_code": f'"threshold": {threshold}',
+                        "new_code": f'"threshold": {new_threshold}',
+                        "reason": f"仅{total_trades}笔交易，降低{tf}线阈值{threshold}→{new_threshold}增加交易频率",
+                    })
+
+    # ── 2. agents/decision.py 常量调整 ──
+    decision_path = os.path.join(project_root, "agents", "decision.py")
+    try:
+        with open(decision_path, 'r', encoding='utf-8') as f:
+            decision_content = f.read()
+    except Exception:
+        decision_content = ""
+
+    if decision_content:
+        # 仓位上限：回撤过大 → 降低
+        if max_dd > 30:
+            import re as _re
+            m = _re.search(r'MAX_POSITION_SHORT\s*=\s*(\d+)', decision_content)
+            if m:
+                old_val = int(m.group(1))
+                new_val = max(10, old_val - 5)
+                if new_val != old_val:
+                    code_changes.append({
+                        "file": "agents/decision.py",
+                        "function": "generate_factor_signal",
+                        "old_code": f'MAX_POSITION_SHORT = {old_val}',
+                        "new_code": f'MAX_POSITION_SHORT = {new_val}',
+                        "reason": f"最大回撤{max_dd:.1f}%过大，降低短线仓位上限{old_val}→{new_val}",
+                    })
+
+        # 冷却期：连续亏损多 → 缩短冷却
+        loss_trades = [t for t in closed_trades if t.get("pnl", 0) < 0]
+        if len(loss_trades) >= 5:
+            import re as _re
+            m = _re.search(r'COOLDOWN_DAYS\s*=\s*(\d+)', decision_content)
+            if m:
+                old_val = int(m.group(1))
+                new_val = min(10, old_val + 2)
+                if new_val != old_val:
+                    code_changes.append({
+                        "file": "agents/decision.py",
+                        "function": "generate_factor_signal",
+                        "old_code": f'COOLDOWN_DAYS = {old_val}',
+                        "new_code": f'COOLDOWN_DAYS = {new_val}',
+                        "reason": f"亏损交易{len(loss_trades)}笔过多，延长冷却期{old_val}→{new_val}天",
+                    })
+
+    # ── 3. analysis/holding.py ATR止损调整 ──
+    holding_path = os.path.join(project_root, "analysis", "holding.py")
+    try:
+        with open(holding_path, 'r', encoding='utf-8') as f:
+            holding_content = f.read()
+    except Exception:
+        holding_content = ""
+
+    if holding_content:
+        stop_loss_count = sum(1 for t in closed_trades if "止损" in t.get("reason", ""))
+        if stop_loss_count >= 3:
+            import re as _re
+            m = _re.search(r'ATR_STOP_MID\s*=\s*(\d+\.?\d*)', holding_content)
+            if m:
+                old_val = float(m.group(1))
+                new_val = round(old_val + 0.5, 1)
+                code_changes.append({
+                    "file": "analysis/holding.py",
+                    "function": "evaluate_holding",
+                    "old_code": f'ATR_STOP_MID = {old_val}',
+                    "new_code": f'ATR_STOP_MID = {new_val}',
+                    "reason": f"止损触发{stop_loss_count}次过多，放宽中线ATR止损{old_val}→{new_val}",
+                })
+
+    return code_changes[:5]  # 最多5条
 
 
 def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
@@ -542,44 +780,44 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
             pass  # 良好
         elif total_return > 0:
             issues.append(f"收益率仅{total_return:+.1f}%，缺乏进攻性")
-            must_fix.append("decision_engine.py:'\"position_pct\": 10' → '\"position_pct\": 15' 提高短线仓位")
+            must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中的 base_pos 字典，将 short 对应的值从 20 修改为 30，因为短线仓位过保守导致收益不足。")
         else:
             issues.append(f"负收益{total_return:+.1f}%，系统严重保守或信号错误")
-            must_fix.append("time_frame_runner.py:'score >= 5' → 'score >= 4' 降低BUY阈值以捕捉更多机会")
+            must_fix.append("请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 55 修改为 48，因为当前阈值过高导致短线信号过少、错过入场机会。")
 
         # 2. 夏普比率评估
         if sharpe < 0:
             issues.append(f"夏普比率{sharpe:.2f}<0，风险调整后无超额收益")
-            must_fix.append("decision_engine.py:放宽止损宽度，减少频繁止损")
+            must_fix.append("请打开 analysis/holding.py，找到 evaluate_holding 函数中的 ATR_STOP_SHORT 常量，将其从 1.5 修改为 2.5，因为止损太紧导致频繁止损、无法持有盈利仓位。")
 
         # 3. 最大回撤评估
         if max_dd > 30:
             issues.append(f"最大回撤{max_dd:.1f}%过大，风险控制失效")
-            must_fix.append("decision_engine.py:单线最大仓位从30%→20%，控制集中度风险")
+            must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 50，因为单线仓位过大导致回撤失控。")
 
         # 4. 胜率与交易频率
         if total_trades < 3:
             issues.append(f"仅{total_trades}笔交易，系统过于保守/懒惰")
-            must_fix.append("time_frame_runner.py:'score >= 5' → 'score >= 4' 放宽入场条件")
-            must_fix.append("decision_engine.py:降低各线confidence阈值0.05以增加交易频率")
+            must_fix.append("请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 55 修改为 45，因为交易频率过低说明入场条件过严。")
+            must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 score_strength 的计算公式，降低分母值以放大评分信号。")
         elif win_rate < 30:
             issues.append(f"胜率仅{win_rate:.0f}%，信号质量差")
-            must_fix.append("agent_prompts.py:强化Agent信号过滤，要求多Agent一致才开仓")
+            must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中的趋势过滤条件，将 BEAR 判断从仅限制 short/mid 改为三线全部限制，因为熊市环境下信号质量差。")
 
         # 5. 三线达成率
         target_achievement = {"short": True, "mid": True, "long": True}
         if metrics.get("achievement_short", 0) < 30:
             issues.append(f"短线达成率{metrics['achievement_short']:.0f}%过低，短线策略失效")
             target_achievement["short"] = False
-            must_fix.append("agent_prompts.py:SHORT_TERM_PROMPT要求更精确的入场时机(RSI<40+放量)")
+            must_fix.append("请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 55 修改为 48，因为短线达成率过低说明入场信号不足。")
         if metrics.get("achievement_mid", 0) < 30:
             issues.append(f"中线达成率{metrics['achievement_mid']:.0f}%过低，中线策略失效")
             target_achievement["mid"] = False
-            must_fix.append("agent_prompts.py:MID_TERM_PROMPT要求趋势确认(MA20向上+MACD>0)")
+            must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 mid 线的 weekly_state 判断条件，将其从 'UP' 放宽为 'UP 或 UNKNOWN'，因为周线过滤过严导致中线信号被误杀。")
         if metrics.get("achievement_long", 0) < 30:
             issues.append(f"长线达成率{metrics['achievement_long']:.0f}%过低，长线策略失效")
             target_achievement["long"] = False
-            must_fix.append("agent_prompts.py:LONG_TERM_PROMPT要求高ROE+高成长双重验证")
+            must_fix.append("请打开 analysis/factor_weights.json，找到 long 对象中的 threshold，将其从 55 修改为 50，因为长线阈值过高导致无法捕捉长期趋势机会。")
 
         # 6. 亏损交易分析
         loss_trades = [t for t in closed_trades if t["pnl"] < 0]
@@ -589,11 +827,10 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
             avg_loss_pct = sum(t["pnl_pct"] for t in loss_trades) / len(loss_trades)
             lost_trades_analysis = (f"{len(loss_trades)}笔亏损，总亏¥{total_loss:,.0f}，"
                                     f"平均亏损{avg_loss_pct:+.1f}%。")
-            # 分析亏损原因
             large_losses = [t for t in loss_trades if t["pnl_pct"] < -10]
             if large_losses:
                 lost_trades_analysis += f" {len(large_losses)}笔巨亏(<-10%)，止损执行不力。"
-                must_fix.append("decision_engine.py:强制硬止损(短线-5%/中线-12%/长线-25%)而非仅靠动态退出")
+                must_fix.append("请打开 analysis/holding.py，找到 evaluate_holding 函数中短线的 ATR 止损计算，将 ATR 倍数从 1.5 修改为 2.0，因为止损过紧导致频繁触发、应适当放宽止损空间。")
             stop_losses = [t for t in loss_trades if "止损" in t.get("reason", "")]
             if stop_losses:
                 lost_trades_analysis += f" {len(stop_losses)}笔止损触发，止损位设置可能过紧。"
@@ -606,7 +843,7 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
             avg_win_pct = sum(t["pnl_pct"] for t in win_trades_list) / len(win_trades_list)
             if avg_win_pct < 15:
                 issues.append(f"平均盈利仅{avg_win_pct:.1f}%，止盈过早或目标太低")
-                must_fix.append("decision_engine.py:提高动态止盈触发阈值(短线10%→15%，中线30%→40%)")
+                must_fix.append("请打开 analysis/holding.py，找到 evaluate_holding 函数中盈利>10%启用移动止盈的条件，将其从 10% 修改为 15%，因为止盈触发过早导致利润被截断。")
 
         # ── 综合评分 ──
         issue_count = len(issues)
@@ -635,7 +872,8 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
             "all_issues": issues,
             "lost_trades_analysis": lost_trades_analysis,
             "target_achievement": target_achievement,
-            "must_fix": must_fix[:4],  # 最多4条
+            "code_changes": [],
+            "must_fix": must_fix[:5],  # 最多5条人工执行清单
             "score_breakdown": {
                 "return_quality": min(10, max(1, int(6 + total_return / 10))),
                 "risk_control": min(10, max(1, int(10 - max_dd / 5))),
@@ -645,26 +883,32 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
             },
         }
     else:
-        # 使用 DeepSeek API 进行回测评审
+        # 使用 DeepSeek API 进行回测评审（压缩上下文 + 长超时 + 降级兜底）
         prompt = ALL_PROMPTS["critic_agent"]
+        compressed = _compress_backtest_context(
+            metrics, closed_trades, symbol,
+            backtest_result.get('start_date', '?'),
+            backtest_result.get('end_date', '?'),
+        )
         try:
-            raw = deepseek_chat(prompt,
-                f"请严格审查以下回测结果:\n\n{context}\n\n请输出JSON分析结果，包含overall_score/main_issue/must_fix字段。")
+            raw = deepseek_chat(
+                prompt,
+                f"请严格审查以下回测结果:\n\n{compressed}\n\n"
+                f"请输出JSON分析结果，必须包含overall_score/main_issue/code_changes/must_fix字段。\n"
+                f"code_changes是最重要的字段，包含可执行的代码替换指令数组。每条指令格式：\n"
+                f'{{"file":"文件路径","function":"函数名","old_code":"原代码","new_code":"新代码","reason":"原因"}}',
+                timeout=(10, 120),  # connect 10s, read 120s
+            )
             result = _parse_json(raw)
             if "target_achievement" not in result:
                 result["target_achievement"] = {"short": True, "mid": True, "long": True}
             if "lost_trades_analysis" not in result:
                 result["lost_trades_analysis"] = "API分析模式"
+            if "code_changes" not in result:
+                result["code_changes"] = []
         except Exception as e:
-            result = {
-                "overall_score": 5,
-                "main_issue": f"Critic API调用失败: {e}",
-                "all_issues": [],
-                "lost_trades_analysis": "API分析失败",
-                "target_achievement": {"short": True, "mid": True, "long": True},
-                "must_fix": [],
-                "score_breakdown": {},
-            }
+            print(f"  ⚠ DeepSeek API 超时/失败 ({type(e).__name__}: {e})，降级为本地启发式分析")
+            result = _heuristic_critique_fallback(metrics, closed_trades)
 
     # 打印点评
     print(f"\n  ╔══ BACKTEST CRITIC 评分 ══╗")
@@ -677,13 +921,13 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
     print(f"  📋 亏损分析: {result.get('lost_trades_analysis', '')[:120]}")
     fixes = result.get("must_fix", [])
     if fixes:
-        print(f"  🔧 修改指令 ({len(fixes)}条):")
-        for f in fixes:
-            print(f"    • {f}")
+        print(f"\n  📋 人工执行清单 ({len(fixes)}条):")
+        for i, f in enumerate(fixes, 1):
+            print(f"    {i}. {f}")
     sb = result.get("score_breakdown", {})
     if sb:
         dims = " | ".join(f"{k}={v}" for k, v in sb.items())
-        print(f"  📊 维度: {dims}")
+        print(f"\n  📊 维度: {dims}")
     print()
 
     return result
@@ -1044,7 +1288,7 @@ def deep_dive_losing_trades(trade_log: list, time_frame: str = "mid",
             patterns.append(f"频繁小额止损({len(small_loss)}笔<5%)")
             root_causes.append("止损宽度过窄，正常波动被震出")
             fix_suggestions.append(
-                f"holding_evaluator.py:mid_atr_stop: 中线ATR止损倍数从2.5×→3.0×，"
+                f"analysis/holding.py:mid_atr_stop: 中线ATR止损倍数从2.5×→3.0×，"
                 f"减少正常波动触发止损"
             )
 
@@ -1062,7 +1306,7 @@ def deep_dive_losing_trades(trade_log: list, time_frame: str = "mid",
             patterns.append(f"灾难性亏损({len(large_loss)}笔<-15%)")
             root_causes.append("止损执行不及时或未设置硬止损")
             fix_suggestions.append(
-                f"holding_evaluator.py: 中长线增加硬止损线"
+                f"analysis/holding.py: 中长线增加硬止损线"
                 f"({'中线-12%' if time_frame == 'mid' else '长线-25%'})，"
                 f"无论什么理由触及即斩仓"
             )
@@ -1072,7 +1316,7 @@ def deep_dive_losing_trades(trade_log: list, time_frame: str = "mid",
             patterns.append(f"震荡市假突破信号({signal_count}笔信号相关亏损)")
             root_causes.append("SIDEWAYS市场中突破信号可靠性低，未做额外过滤")
             fix_suggestions.append(
-                "holding_evaluator.py: SIDEWAYS中线仅允许网格建仓，"
+                "analysis/holding.py: SIDEWAYS中线仅允许网格建仓，"
                 "禁止在SIDEWAYS中追突破信号"
             )
 
@@ -1082,7 +1326,7 @@ def deep_dive_losing_trades(trade_log: list, time_frame: str = "mid",
             patterns.append(f"盈利回撤转亏损({len(profit_to_loss)}笔)")
             root_causes.append("移动止盈触发过晚或回撤容忍度过大")
             fix_suggestions.append(
-                "holding_evaluator.py: 中长线移动止盈回撤阈值从5%→3%，"
+                "analysis/holding.py: 中长线移动止盈回撤阈值从5%→3%，"
                 "盈利>10%即启用保护"
             )
 
@@ -1090,7 +1334,7 @@ def deep_dive_losing_trades(trade_log: list, time_frame: str = "mid",
             patterns.append("亏损模式不明显，可能是个别偶发事件")
             root_causes.append("个券异动或大盘系统性风险")
             fix_suggestions.append(
-                "critic_agent.py:deep_dive_losing_trades: 继续监控，暂无代码修改建议"
+                "agents/critic.py:deep_dive_losing_trades: 继续监控，暂无代码修改建议"
             )
 
         result = {

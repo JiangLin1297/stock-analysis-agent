@@ -627,25 +627,46 @@ def _compute_breakout_signals(data: dict) -> dict:
 def _compute_trend_state(quote: dict, technical: dict) -> dict:
     """
     计算当前市场趋势状态。
-    BULL: 价格 > MA60 且 MA60 斜率 > 0
-    BEAR: 价格 < MA60 且 MA60 斜率 < 0
-    SIDEWAYS: 其他所有情况
+
+    BULL: 价格 > MA60 且 MA60斜率 > 0 且 价格 > MA20 且 MA5 > MA10
+          （长周期确认 + 短周期确认，避免 MA60 滞后误判）
+    BEAR: 价格 < MA60 且 MA60斜率 < 0
+    SIDEWAYS: 其他所有情况（含短周期走弱的降级）
     """
     price = quote.get("price") or technical.get("close")
     ma60 = technical.get("ma60")
     ma60_slope = technical.get("ma60_slope")
+    ma20 = technical.get("ma20")
+    ma10 = technical.get("ma10")
+    ma5 = technical.get("ma5")
 
     if price is None or ma60 is None:
         return {"trend_state": "SIDEWAYS", "ma60_slope": None, "reason": "数据不足"}
 
     slope = ma60_slope if ma60_slope is not None else 0
 
-    if price > ma60 and slope > 0:
-        state = "BULL"
-        reason = f"价格{price}>MA60({ma60})+MA60斜率{slope}%>0"
-    elif price < ma60 and slope < 0:
+    if price < ma60 and slope < 0:
         state = "BEAR"
         reason = f"价格{price}<MA60({ma60})+MA60斜率{slope}%<0"
+    elif price > ma60 and slope > 0:
+        # 长周期确认向上，还需短周期确认
+        short_weak = False
+        if ma20 is not None and price < ma20:
+            short_weak = True
+        if ma5 is not None and ma10 is not None and ma5 < ma10:
+            short_weak = True
+
+        if short_weak:
+            state = "SIDEWAYS"
+            details = []
+            if ma20 is not None and price < ma20:
+                details.append(f"价格{price}<MA20({ma20})")
+            if ma5 is not None and ma10 is not None and ma5 < ma10:
+                details.append(f"MA5({ma5})<MA10({ma10})")
+            reason = f"MA60趋势向上但短周期走弱: {'，'.join(details)}，降级为SIDEWAYS"
+        else:
+            state = "BULL"
+            reason = f"价格{price}>MA60({ma60})+MA60斜率{slope}%>0+短周期共振确认"
     else:
         state = "SIDEWAYS"
         if abs(slope) < 0.1:

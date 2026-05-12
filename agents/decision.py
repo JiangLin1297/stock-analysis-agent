@@ -827,11 +827,14 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         wt = market_state.get("weekly_trend", {})
         weekly_state = wt.get("weekly_trend", "UNKNOWN") if isinstance(wt, dict) else "UNKNOWN"
 
-    # 提取行情数据用于计算止损
+    # 提取行情数据用于计算止损和入场判断
     price = None
     boll_lower = None
     boll_upper = None
     atr = None
+    rsi14 = None
+    ma5_slope = None
+    ma20_slope = None
     if compressed_data:
         q = compressed_data.get("quote", {})
         t = compressed_data.get("technical", {})
@@ -839,16 +842,25 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         boll_lower = t.get("boll_lower")
         boll_upper = t.get("boll_upper")
         atr = t.get("atr14")
+        rsi14 = t.get("rsi14") or t.get("rsi")
+        ma5_slope = t.get("ma5_slope")
+        ma20_slope = t.get("ma20_slope")
+
+    # ── 放宽入场条件: 短/中MA任一上行 + RSI>40 即可入场 ──
+    ma_trend_up = (ma5_slope is not None and ma5_slope > 0) or \
+                  (ma20_slope is not None and ma20_slope > 0)
+    rsi_ok = rsi14 is not None and rsi14 > 40
+    if signal == "HOLD" and ma_trend_up and rsi_ok:
+        signal = "BUY"
 
     # ── 仓位计算 ──
-    # 基础仓位 = 评分强度 × 基准仓位
     score_strength = (score - threshold) / max(threshold, 1)  # -1.0 ~ +1.0
-    base_pos = {"short": 10, "mid": 18, "long": 25}.get(tf, 15)
+    base_pos = {"short": 20, "mid": 30, "long": 40}.get(tf, 25)
 
     if score_strength > 0:
-        position_pct = min(base_pos * (1 + score_strength * 2), 45)
+        position_pct = min(base_pos * (1 + score_strength * 2), 80)
     elif score_strength > -0.3:
-        position_pct = max(base_pos * 0.5, 5)
+        position_pct = max(base_pos * 0.5, 10)
     else:
         position_pct = 0
 
@@ -913,9 +925,9 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
     if risk_state:
         dd = risk_state.get("drawdown_pct", 0)
         consec = risk_state.get("consecutive_losses", 0)
-        if dd > 15 and signal == "BUY":
+        if dd > 5 and signal == "BUY":
             override_action = "HOLD"
-            override_reason = f"总资产回撤{dd}%>15%,新开仓暂停"
+            override_reason = f"总资产回撤{dd}%>5%,新开仓暂停"
             position_pct = 0
         if consec >= 3:
             position_pct = max(1, int(position_pct / 2))

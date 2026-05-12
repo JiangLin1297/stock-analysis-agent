@@ -72,7 +72,7 @@ def random_period_test(symbol: str, time_frame: str = "mid",
     if seed is not None:
         random.seed(seed)
 
-    cache_path = download_full_history(symbol, ndays=800)
+    cache_path = download_full_history(symbol, ndays=60)
     df = pd.read_csv(cache_path)
     df['date'] = pd.to_datetime(df['date']).dt.date
 
@@ -118,6 +118,15 @@ def run_backtest(symbol: str, start_date, end_date,
          "trade_log": [...], "equity_curve": [...], "metrics": {...}}
     """
     from data.pipeline import get_historical_snapshot, download_full_history
+
+    # Reload modules to pick up any code changes (Critic injections, etc.)
+    import importlib
+    for _mod in ['agents.decision', 'analysis.holding', 'data.pipeline']:
+        if _mod in sys.modules:
+            try:
+                importlib.reload(sys.modules[_mod])
+            except Exception:
+                pass
     from agents.decision import generate_3d_factor_signals
     from analysis.holding import evaluate_holding
 
@@ -128,7 +137,7 @@ def run_backtest(symbol: str, start_date, end_date,
         from agents.debate import run_debate
 
     # 确保数据已缓存（download_full_history 返回正确的缓存路径）
-    cache_path = download_full_history(symbol, ndays=800)
+    cache_path = download_full_history(symbol, ndays=60)
     df_full = pd.read_csv(cache_path)
     df_full['date'] = pd.to_datetime(df_full['date']).dt.date
 

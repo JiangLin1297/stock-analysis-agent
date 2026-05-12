@@ -69,6 +69,7 @@ def evaluate_holding(symbol: str, entry_price: float, current_price: float,
     turnover = q.get("turnover")
     change_pct = q.get("change_pct")
     ma20_slope = t.get("ma20_slope")
+    ma5_slope = t.get("ma5_slope")
     trend_state = trend.get("trend_state", "SIDEWAYS")
 
     reasons = []
@@ -146,9 +147,14 @@ def evaluate_holding(symbol: str, entry_price: float, current_price: float,
                 reasons.append(f"短线ATR止损:价格{current_price}<ATR止损{atr_stop}(入场{entry_price}-1.5*ATR{atr})→清仓")
                 triggered_rules.append("short_atr_stop")
 
-        # 跌破MA5 → 清仓（保留作为辅助）
+        # 跌破MA5 → 若MA5下行则清仓，否则减半仓
         if ma5 and current_price < ma5:
-            if action != "CLOSE":
+            if ma5_slope is not None and ma5_slope < 0:
+                sell_ratio = 100
+                action = "CLOSE"
+                reasons.append(f"短线MA5破位+下行:价格{current_price}<MA5({ma5}),MA5斜率{ma5_slope}→清仓")
+                triggered_rules.append("short_ma5_break_close")
+            elif action != "CLOSE":
                 sell_ratio = max(sell_ratio, 50)
                 if action not in ("CLOSE",):
                     action = "TRIM"
@@ -209,13 +215,12 @@ def evaluate_holding(symbol: str, entry_price: float, current_price: float,
                 reasons.append(f"中线ATR止损:价格{current_price}<ATR止损{atr_stop}(入场{entry_price}-2.5*ATR{atr})→清仓")
                 triggered_rules.append("mid_atr_stop")
 
-        # MA20走平或向下拐头 → 减半仓
+        # MA20走平或向下拐头 → 直接清仓
         if ma20_slope is not None and ma20_slope <= 0:
-            sell_ratio = max(sell_ratio, 50)
-            if action not in ("CLOSE",):
-                action = "TRIM"
-            reasons.append(f"中线趋势转弱:MA20斜率{ma20_slope}%≤0→减半仓")
-            triggered_rules.append("mid_ma20_flat")
+            sell_ratio = 100
+            action = "CLOSE"
+            reasons.append(f"中线趋势转弱:MA20斜率{ma20_slope}%≤0→清仓")
+            triggered_rules.append("mid_ma20_flat_close")
 
         # 净利润增速转负 → 清仓
         np_growth = f.get("net_profit_growth")

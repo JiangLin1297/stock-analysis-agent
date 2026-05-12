@@ -30,14 +30,6 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stButton > button { font-weight: 600; }
-    .decision-card {
-        border-radius: 12px; padding: 20px; margin: 8px 0;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    }
-    .card-buy { border-left: 4px solid #e74c3c; }
-    .card-sell { border-left: 4px solid #27ae60; }
-    .card-hold { border-left: 4px solid #7f8c8d; }
-    .metric-label { font-size: 0.8rem; color: #888; }
     .live-console {
         background: #1e1e1e; color: #d4d4d4; padding: 16px;
         border-radius: 8px; font-family: 'Consolas', 'Courier New', monospace;
@@ -115,13 +107,20 @@ def action_badge(action: str):
         return ("HOLD", "#7f8c8d")
 
 
+def _sanitize(text: str, max_len: int = 200) -> str:
+    """移除 HTML 标签，返回纯文本."""
+    import re
+    text = str(text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text[:max_len] if max_len else text
+
+
 def decision_card(label, dim):
     if not dim or not isinstance(dim, dict):
         st.info(f"{label}: 暂无数据")
         return
 
     act_text, color = action_badge(dim.get("action", "HOLD"))
-    action = dim.get("action", "N/A")
     entry = dim.get("entry_price", "N/A")
     stop = dim.get("stop_loss_price", "N/A")
     take = dim.get("take_profit_price", "N/A")
@@ -138,45 +137,46 @@ def decision_card(label, dim):
     except (ValueError, TypeError):
         pass
 
-    html = f"""
-    <div class="decision-card" style="border-left:4px solid {color};">
-        <h4>{label} · <b style="color:{color};">{act_text}</b></h4>
-        <table style="width:100%; font-size:0.9rem;">
-            <tr>
-                <td>入场价: <b>{entry}</b></td>
-                <td>止损价: <b>{stop}</b></td>
-                <td>止盈价: <b>{take}</b></td>
-            </tr>
-            <tr>
-                <td>仓位: <b>{pos}%</b></td>
-                <td>置信度: <b>{conf_pct}%</b></td>
-    """
+    # 标题行 (act_text 来自 action_badge，仅含 BUY/SELL/HOLD，安全)
+    st.markdown(
+        f'<span style="font-weight:700;">{label}</span> · '
+        f'<b style="color:{color};font-size:1.1em;">{act_text}</b>',
+        unsafe_allow_html=True,
+    )
+
+    # 指标行
+    r1 = st.columns(3)
+    r1[0].metric("入场价", str(entry))
+    r1[1].metric("止损价", str(stop))
+    r1[2].metric("止盈价", str(take))
+
+    r2_cols = [st.columns(3), st.columns(3)] if expected else [st.columns(3)]
+    r2_cols[0][0].metric("仓位", f"{pos}%")
+    r2_cols[0][1].metric("置信度", f"{conf_pct}%")
     if expected:
-        html += f'<td>预期收益: <b>{expected}%</b></td>'
-    html += """
-            </tr>
-        </table>
-    """
+        r2_cols[0][2].metric("预期收益", f"{expected}%")
+
+    # 附加信息（纯文本，无 HTML）
     if pm:
-        html += f'<p style="margin:6px 0 0 0; font-size:0.85rem;">潜力: {pm}</p>'
+        st.caption(f"潜力: {_sanitize(pm, 100)}")
     if rationale:
-        html += f'<p style="margin:6px 0 0 0; font-size:0.85rem; color:#666;">{rationale[:200]}</p>'
+        st.caption(_sanitize(rationale, 200))
     if exit_strategy:
-        etype = exit_strategy.get("type", "N/A")
-        rules = "; ".join(exit_strategy.get("rules", [])[:3])
-        html += f'<p style="margin:4px 0 0 0; font-size:0.8rem; color:#999;">退出: {etype} | {rules}</p>'
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
+        etype = _sanitize(exit_strategy.get("type", "N/A"), 50)
+        rules = "; ".join(_sanitize(r, 80) for r in exit_strategy.get("rules", [])[:3])
+        st.caption(f"退出: {etype} | {rules}")
+
+    st.divider()
 
 
 # ═══════════════════════════════════════════════════════════════
 # 后台分析线程
 # ═══════════════════════════════════════════════════════════════
 
-def _run_analysis_thread(symbol, use_mock, use_portfolio):
-    """在后台线程中运行 run_full_analysis，输出实时写入 session_state."""
+def _run_analysis_thread(symbol, use_mock, use_portfolio, shared_state):
+    """在后台线程中运行 run_full_analysis，输出写入共享字典（不访问 st.session_state）."""
     capture_lock = threading.Lock()
-    output_lines = st.session_state["_analysis_output"]
+    output_lines = shared_state["output"]
     output_lines.clear()
 
     capture = _LiveCapture(output_lines, capture_lock)
@@ -192,23 +192,20 @@ def _run_analysis_thread(symbol, use_mock, use_portfolio):
             use_portfolio=use_portfolio,
             use_adapted_params=True,
         )
-        st.session_state["_analysis_result"] = result
-        st.session_state["_analysis_error"] = None
+        shared_state["result"] = result
+        shared_state["error"] = None
 
         # 更新新闻源状态
         data = result.get("compressed_data", {})
         news = data.get("news", []) if isinstance(data, dict) else []
-        if news and len(news) > 0:
-            st.session_state["_news_status"] = f"{len(news)}条可用"
-        else:
-            st.session_state["_news_status"] = "无数据"
+        shared_state["news_status"] = f"{len(news)}条可用" if news else "无数据"
     except Exception as e:
-        st.session_state["_analysis_result"] = None
-        st.session_state["_analysis_error"] = f"{type(e).__name__}: {e}"
-        st.session_state["_news_status"] = "未获取"
+        shared_state["result"] = None
+        shared_state["error"] = f"{type(e).__name__}: {e}"
+        shared_state["news_status"] = "未获取"
     finally:
         sys.stdout = old_stdout
-        st.session_state["_analysis_running"] = False
+        shared_state["running"] = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -397,13 +394,28 @@ if current_page == "深度分析":
     st.title("🔬 深度分析")
     st.caption("融合多Agent + 三线时间维度 + 多空辩论，生成综合交易决策")
 
-    # ── 正在分析中 → 显示实时输出 ──
+    # ── 正在分析中 → 从共享状态同步并显示实时输出 ──
     if st.session_state["_analysis_running"]:
+        shared = st.session_state.get("_analysis_shared")
+        if shared is None:
+            st.session_state["_analysis_running"] = False
+            st.rerun()
+
+        # 线程结束 → 同步结果到 session_state
+        if not shared["running"]:
+            st.session_state["_analysis_output"] = shared["output"]
+            st.session_state["_analysis_result"] = shared["result"]
+            st.session_state["_analysis_error"] = shared["error"]
+            if shared["news_status"]:
+                st.session_state["_news_status"] = shared["news_status"]
+            st.session_state["_analysis_running"] = False
+            st.rerun()
+
         symbol = st.session_state["_analysis_symbol"]
         st.info(f"正在分析 **{symbol}** ... 请等待各阶段完成")
 
-        # 阶段进度条
-        output_text = "".join(st.session_state["_analysis_output"])
+        # 阶段进度条（从共享列表读取，线程安全）
+        output_text = "".join(shared["output"])
         stage_map = {
             "STAGE:1/5": ("数据获取", 0.1),
             "STAGE:2/5": ("多Agent分析", 0.35),
@@ -420,19 +432,21 @@ if current_page == "深度分析":
 
         st.progress(current_stage, text=current_label)
 
-        # 实时控制台
+        # 实时控制台 (escape HTML entities to prevent tag rendering)
         console_placeholder = st.empty()
         with console_placeholder.container():
+            import html as _html_mod
+            safe_text = _html_mod.escape(output_text[-6000:]) or "等待输出..."
             st.markdown(
-                f'<div class="live-console">{output_text[-6000:] or "等待输出..."}</div>',
+                f'<div class="live-console">{safe_text}</div>',
                 unsafe_allow_html=True,
             )
-            st.caption(f"已输出 {len(st.session_state['_analysis_output'])} 行")
+            st.caption(f"已输出 {len(shared['output'])} 行")
 
-        # 超时检测: 超过 90 秒无新输出则警告
+        # 超时检测
         now = time.time()
         last = st.session_state.get("_analysis_last_poll", now)
-        if now - last > 30 and len(st.session_state["_analysis_output"]) == 0:
+        if now - last > 30 and len(shared["output"]) == 0:
             st.warning("等待数据拉取中，若持续无输出请检查网络...")
 
         st.session_state["_analysis_last_poll"] = now
@@ -470,7 +484,7 @@ if current_page == "深度分析":
 
             engine = result.get("_decision_engine", "unknown")
             engine_label = "因子模型统计引擎" if engine == "factor_model" else "LLM综合管线"
-            st.caption(f"决策引擎: {engine_label} | LLM复核: {'已执行' if result.get('llm_review') else '无需(评分明确)'}")
+            st.caption(f"决策引擎: {engine_label} | 纯统计决策，无LLM参与")
 
             # ── 因子评分明细 ──
             with st.expander("📊 因子评分明细", expanded=False):
@@ -585,9 +599,19 @@ if current_page == "深度分析":
             st.session_state["_analysis_last_poll"] = time.time()
             st.session_state.deep_symbol = symbol.strip()
 
+            # 共享状态 — 线程写入此字典，主线程轮询同步到 session_state
+            shared = {
+                "output": [],
+                "result": None,
+                "error": None,
+                "news_status": None,
+                "running": True,
+            }
+            st.session_state["_analysis_shared"] = shared
+
             thread = threading.Thread(
                 target=_run_analysis_thread,
-                args=(symbol.strip(), use_mock, use_portfolio),
+                args=(symbol.strip(), use_mock, use_portfolio, shared),
                 daemon=True,
             )
             thread.start()

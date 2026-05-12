@@ -346,38 +346,31 @@ def _parse_agent_json(raw_text: str, agent_name: str) -> dict:
 
 
 def _validate_agent_result(result: dict, agent_name: str) -> dict:
-    """校验并补全 Agent 输出字段。兼容新旧两种格式。
+    """校验并补全 Agent 输出字段。仅接受结构化数据格式。
 
-    新格式(量化基金): agent 输出结构化数据(trend_strength/valuation_score等)
-    旧格式(legacy): agent 输出 BUY/SELL 信号 — 仍兼容但标记为 legacy
+    Agent 只输出结构化数据(trend_strength/valuation_score等)，
+    不接受 BUY/SELL 信号 — 信号由因子模型统一生成。
     """
     result["agent"] = agent_name
     result["type"] = "LLM(DeepSeek V4)"
 
-    # 判断新旧格式
     has_structured = any(k in result for k in (
         "trend_strength", "valuation_score", "sentiment_score_raw", "market_regime",
         "momentum_score", "trend_quality_score", "growth_potential_score"
     ))
-    has_signal = "signal" in result
 
     if has_structured:
         result["type"] = "LLM(DeepSeek V4) — 结构化数据"
-        # 从结构化字段推断置信度
         if "confidence" not in result:
             result["confidence"] = 0.7
-    elif has_signal:
-        # 旧格式兼容: 保留信号但标记来源
-        result["type"] = "LLM(DeepSeek V4) — Legacy信号(兼容)"
-        signal = str(result.get("signal", "HOLD")).upper().strip()
-        result["signal"] = signal if signal in ("BUY", "SELL", "HOLD", "CAUTIOUS_BUY", "CAUTIOUS_SELL") else "HOLD"
-        try:
-            result["score"] = max(-10, min(10, int(result.get("score", 0))))
-        except (ValueError, TypeError):
-            result["score"] = 0
     else:
+        # 无结构化数据 → 解析失败（不接受旧格式 BUY/SELL 信号）
         result["type"] = "LLM(DeepSeek V4) — 解析失败"
         result["confidence"] = 0.30
+
+    # 移除任何残留的 signal/score 字段（Agent 不应输出买卖信号）
+    result.pop("signal", None)
+    result.pop("score", None)
 
     try:
         result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.5))))
