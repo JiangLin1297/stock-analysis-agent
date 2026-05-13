@@ -600,6 +600,20 @@ def _generate_code_changes(metrics: dict, closed_trades: list) -> list:
         weights = None
 
     if weights:
+        # 0笔交易：系统过于保守，大幅降低阈值
+        if total_trades == 0:
+            for tf in ["short", "mid"]:
+                threshold = weights.get(tf, {}).get("threshold", 55)
+                new_threshold = max(40, threshold - 5)
+                if new_threshold != threshold:
+                    code_changes.append({
+                        "file": "analysis/factor_weights.json",
+                        "function": "",
+                        "old_code": f'"threshold": {threshold}',
+                        "new_code": f'"threshold": {new_threshold}',
+                        "reason": f"0笔交易，降低{tf}线阈值{threshold}→{new_threshold}放宽入场",
+                    })
+
         if win_rate < 20 and total_trades >= 3:
             for tf in ["short", "mid", "long"]:
                 threshold = weights.get(tf, {}).get("threshold", 55)
@@ -626,7 +640,7 @@ def _generate_code_changes(metrics: dict, closed_trades: list) -> list:
                         "reason": f"负收益{total_return:+.1f}%，降低{tf}线阈值{threshold}→{new_threshold}",
                     })
 
-        if total_trades < 3:
+        if 0 < total_trades < 3:
             for tf in ["short", "mid"]:
                 threshold = weights.get(tf, {}).get("threshold", 55)
                 new_threshold = max(40, threshold - 5)
@@ -929,6 +943,55 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
         dims = " | ".join(f"{k}={v}" for k, v in sb.items())
         print(f"\n  📊 维度: {dims}")
     print()
+
+    # ── 生成 operations（可执行修改指令）──
+    if not result.get("operations"):
+        # 从 code_changes 转换为 operations
+        code_changes = result.get("code_changes", [])
+        if not code_changes:
+            # code_changes 为空时，尝试重新生成
+            code_changes = _generate_code_changes(metrics, closed_trades)
+            result["code_changes"] = code_changes
+
+        operations = []
+        for cc in code_changes:
+            if not isinstance(cc, dict) or not cc.get("file") or not cc.get("new_code"):
+                continue
+            file_path = cc["file"]
+            old_code = cc.get("old_code", "")
+            new_code = cc["new_code"]
+
+            if file_path.endswith(".json"):
+                # 从 reason 推断 timeframe
+                tf = "short"
+                for t in ["short", "mid", "long"]:
+                    if t in cc.get("reason", ""):
+                        tf = t
+                        break
+                m = re.search(r'"(\w+)":\s*[\d.]+', old_code)
+                if m:
+                    target = f"{tf}.{m.group(1)}"
+                else:
+                    target = old_code
+                m2 = re.search(r'[\d.]+', new_code)
+                new_value = float(m2.group()) if m2 else new_code
+            else:
+                # Python 文件：从 old_code 提取变量名
+                m = re.search(r'(\b[A-Z_][A-Z0-9_]*)\s*=', old_code)
+                if m:
+                    target = m.group(1)
+                else:
+                    target = cc.get("function", old_code)
+                m2 = re.search(r'[\d.]+', new_code)
+                new_value = float(m2.group()) if m2 else new_code
+
+            operations.append({"file": file_path, "target": target, "new_value": new_value})
+
+        if operations:
+            result["operations"] = operations
+            print(f"  🔧 生成 {len(operations)} 条可执行修改指令:")
+            for op in operations:
+                print(f"    • {op['file']}:{op['target']} = {op['new_value']}")
 
     return result
 

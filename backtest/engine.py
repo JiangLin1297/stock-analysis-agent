@@ -53,10 +53,50 @@ def _count_consecutive_losses(trade_log: list) -> int:
     return count
 
 
+def _validate_period(df: dict, start_idx: int, days: int,
+                     min_avg_change: float = 1.5,
+                     min_bullish_pct: float = 0.20) -> tuple:
+    """检查历史区间是否有足够的交易机会。
+
+    Returns:
+        (passed: bool, avg_abs_change: float, bullish_pct: float)
+    """
+    seg = df.iloc[start_idx:start_idx + days].copy()
+    if len(seg) < days * 0.8:
+        return False, 0.0, 0.0
+
+    # 日均涨跌幅绝对值
+    if 'pct_change' not in seg.columns:
+        seg['pct_change'] = seg['close'].pct_change() * 100
+    avg_abs = seg['pct_change'].abs().mean()
+    if pd.isna(avg_abs):
+        avg_abs = 0.0
+
+    # 多头排列天数 (MA5 > MA20)
+    if 'ma5' not in seg.columns or 'ma20' not in seg.columns:
+        seg['ma5'] = seg['close'].rolling(5).mean()
+        seg['ma20'] = seg['close'].rolling(20).mean()
+    valid_ma = seg.dropna(subset=['ma5', 'ma20'])
+    if len(valid_ma) > 0:
+        bullish_count = (valid_ma['ma5'] > valid_ma['ma20']).sum()
+        bullish_pct = bullish_count / len(valid_ma)
+    else:
+        bullish_pct = 0.0
+
+    passed = avg_abs >= min_avg_change and bullish_pct >= min_bullish_pct
+    return passed, avg_abs, bullish_pct
+
+
 def random_period_test(symbol: str, time_frame: str = "mid",
                        days: int = 60, seed: int = None) -> dict:
     """
-    随机选取一段历史区间用于回测。
+    随机选取一段具有足够交易机会的历史区间用于回测。
+
+    选取策略：
+      1. 随机选起始日期
+      2. 验证区间内日均涨跌幅 >= 1.5% 且多头排列天数 >= 20%
+      3. 不满足则重试（最多10次），保留波动率最高的候选区间
+      4. 超过重试次数后使用最佳候选
 
     Args:
         symbol: 股票代码
@@ -72,21 +112,61 @@ def random_period_test(symbol: str, time_frame: str = "mid",
     if seed is not None:
         random.seed(seed)
 
-    cache_path = download_full_history(symbol, ndays=60)
+    # 下载足够的数据：请求天数 + 30天预热 + 30天缓冲
+    ndays = days + 60
+    cache_path = download_full_history(symbol, ndays=ndays)
     df = pd.read_csv(cache_path)
     df['date'] = pd.to_datetime(df['date']).dt.date
+    df = df.sort_values('date').reset_index(drop=True)
 
     all_dates = sorted(df['date'].unique())
-    if len(all_dates) < days + 30:
-        raise ValueError(f"历史数据不足: 需要{days+30}天，实际{len(all_dates)}天")
+    warmup = 30  # 前30天用于预热
+    if len(all_dates) < days + warmup:
+        raise ValueError(f"历史数据不足: 需要{days+warmup}天，实际{len(all_dates)}天")
 
-    # 排除最近30天（避免数据不完整），随机选起始位置
-    max_start_idx = len(all_dates) - days - 30
-    start_idx = random.randint(30, max_start_idx)  # 前30天用于预热指标计算
-    start_date = all_dates[start_idx]
-    end_idx = min(start_idx + days, len(all_dates) - 1)
+    max_start_idx = len(all_dates) - days - 1
+    if max_start_idx <= warmup:
+        max_start_idx = warmup + 1
+
+    # 重试选取满足条件的区间
+    MAX_RETRIES = 10
+    best_idx = None
+    best_score = -1.0
+    best_stats = (0.0, 0.0)
+
+    for attempt in range(MAX_RETRIES):
+        start_idx = random.randint(warmup, max_start_idx)
+
+        passed, avg_abs, bull_pct = _validate_period(df, start_idx, days)
+
+        # 记录最佳候选（以波动率为主要评分）
+        score = avg_abs + bull_pct * 5
+        if score > best_score:
+            best_score = score
+            best_idx = start_idx
+            best_stats = (avg_abs, bull_pct)
+
+        if passed:
+            start_date = all_dates[start_idx]
+            end_idx = min(start_idx + days, len(all_dates) - 1)
+            end_date = all_dates[end_idx]
+            print(f"  [选区间] 第{attempt+1}次尝试通过 "
+                  f"(日均波动={avg_abs:.2f}%, 多头={bull_pct:.0%})")
+            return {
+                "symbol": symbol,
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "days": days,
+                "time_frame": time_frame,
+                "seed": seed,
+            }
+
+    # 所有重试均未通过，使用最佳候选
+    start_date = all_dates[best_idx]
+    end_idx = min(best_idx + days, len(all_dates) - 1)
     end_date = all_dates[end_idx]
-
+    print(f"  [选区间] {MAX_RETRIES}次重试均未达标，使用最佳候选 "
+          f"(日均波动={best_stats[0]:.2f}%, 多头={best_stats[1]:.0%})")
     return {
         "symbol": symbol,
         "start_date": str(start_date),
@@ -121,7 +201,7 @@ def run_backtest(symbol: str, start_date, end_date,
 
     # Reload modules to pick up any code changes (Critic injections, etc.)
     import importlib
-    for _mod in ['agents.decision', 'analysis.holding', 'data.pipeline']:
+    for _mod in ['agents.decision', 'analysis.holding', 'analysis.alpha', 'data.pipeline']:
         if _mod in sys.modules:
             try:
                 importlib.reload(sys.modules[_mod])
@@ -390,6 +470,14 @@ def run_backtest(symbol: str, start_date, end_date,
                                 "open_date": str(trade_date),
                                 "stop_loss": stop_loss,
                             }
+                            # 因子贡献明细
+                            contribs = dim.get("contributions", dim.get("_factor_contributions", {}))
+                            top_contribs = sorted(
+                                ((k, v) for k, v in contribs.items() if not k.startswith("_") and v != 0),
+                                key=lambda x: abs(x[1]), reverse=True
+                            )[:5]
+                            contrib_str = "; ".join(f"{k}={v:+.1f}" for k, v in top_contribs)
+
                             trade_log.append({
                                 "date": str(trade_date),
                                 "timeframe": tf_key,
@@ -400,6 +488,8 @@ def run_backtest(symbol: str, start_date, end_date,
                                 "pnl": 0,
                                 "pnl_pct": 0,
                                 "reason": dim.get("rationale", "")[:80],
+                                "factor_score": dim.get("_factor_score", 0),
+                                "factor_contributions": contrib_str,
                             })
 
         # 4. 更新总权益
@@ -613,11 +703,17 @@ def format_results(result: dict) -> str:
     # 交易明细（最近10条）
     lines.append(f"\n  ── 交易明细 (最近10条) ──")
     lines.append(f"  {'日期':<12} {'维度':<6} {'操作':<10} {'价格':>8} {'数量':>6} {'盈亏':>10} {'盈亏%':>8}")
-    lines.append(f"  {'-'*60}")
+    lines.append(f"  {'-'*70}")
     for t in tf_log[-10:]:
         lines.append(f"  {t['date']:<12} {t['timeframe']:<6} {t['action']:<10} "
                      f"{t['price']:>8.2f} {t['quantity']:>6d} "
                      f"{t['pnl']:>+10.2f} {t['pnl_pct']:>+7.2f}%")
+        # 显示因子贡献明细（仅BUY操作）
+        if t['action'] == 'BUY' and t.get('factor_contributions'):
+            lines.append(f"    └─ 因子评分={t.get('factor_score',0):.0f}/100 "
+                         f"驱动: {t['factor_contributions']}")
+        if t.get('reason'):
+            lines.append(f"    └─ {t['reason'][:60]}")
 
     lines.append(f"\n{'='*70}\n")
     return "\n".join(lines)

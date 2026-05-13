@@ -1,15 +1,12 @@
 @echo off
-chcp 65001 >nul
-title StockMind - 多Agent深度股析系统
-
-echo  正在启动 StockMind ...
-
-if exist "%~dp0dist\StockMind\StockMind.exe" (
-    start "" "%~dp0dist\StockMind\StockMind.exe"
-) else if exist "%~dp0dist\StockAgent\StockAgent.exe" (
-    start "" "%~dp0dist\StockAgent\StockAgent.exe"
-) else (
-    echo  未找到打包的 exe，使用 Python 启动...
-    python "%~dp0desktop_app.py"
+cd /d %~dp0
+echo 正在检查 Streamlit...
+pip show streamlit >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Streamlit 未安装，正在安装...
+    pip install streamlit
 )
-exit 0
+echo 启动 StockMind 网页端...
+start "" http://localhost:8501
+streamlit run web_ui.py --server.port 8501
+pause

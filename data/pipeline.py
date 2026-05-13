@@ -810,13 +810,13 @@ def download_full_history(symbol: str, ndays: int = 800) -> str:
     sym, exchange = normalize_symbol(symbol)
     cache_path = os.path.join(HISTORY_CACHE_DIR, f"{sym}.csv")
 
-    # 检查缓存是否有效（24小时内）
+    # 检查缓存是否有效（24小时内 且 数据量充足）
     if os.path.exists(cache_path):
         mtime = os.path.getmtime(cache_path)
         if time.time() - mtime < 86400:
             try:
                 df = pd.read_csv(cache_path)
-                if len(df) >= 50:
+                if len(df) >= ndays * 0.5:
                     return cache_path
             except Exception:
                 pass

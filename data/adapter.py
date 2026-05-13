@@ -603,14 +603,10 @@ def auto_adapt_and_backtest(symbol: str, time_frame: str = "mid",
         if extra_rounds > 0:
             print(f"\n  [迭代] 基于诊断结果追加 {extra_rounds} 轮改进...")
             from evolution.improver import apply_fix
-            project_dir = _data_dir()
-            plan = diag.get("improvement_plan", {})
-            short_fixes = plan.get("short_term", [])
-            for fix in short_fixes[:2]:
-                try:
-                    apply_fix(fix, project_dir)
-                except Exception:
-                    pass
+            try:
+                apply_fix(diag)
+            except Exception:
+                pass
 
             # 重新回测
             from backtest.runner import run_backtest_with_critic as _rerun

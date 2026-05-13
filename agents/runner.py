@@ -290,7 +290,7 @@ def run_risk_manager(data: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _call_llm_agent(agent_name: str, system_prompt: str, context_text: str,
-                    use_mock: bool = False) -> dict:
+                    use_mock: bool = False, timeout: int = 60) -> dict:
     """
     调用 LLM Agent，解析返回的 JSON。
     use_mock=True 时使用启发式规则模拟输出。
@@ -300,7 +300,7 @@ def _call_llm_agent(agent_name: str, system_prompt: str, context_text: str,
 
     prompt_filled = system_prompt.replace("{{context}}", context_text)
     try:
-        raw = DeepSeekClient().chat(prompt_filled, "请输出JSON分析结果。", timeout=30)
+        raw = DeepSeekClient().chat(prompt_filled, "请输出JSON分析结果。", timeout=timeout)
         return _parse_agent_json(raw, agent_name)
     except Exception as e:
         print(f"  [WARN] {agent_name} 分析超时/失败: {e}，使用本地启发式替代")
@@ -671,7 +671,9 @@ def run_all_agents(compressed_data: dict, use_mock: bool = False) -> list[dict]:
         print(f"{card_line('Extracting structured data...')}")
         print(f"{card_bottom()}")
 
-        report = _call_llm_agent(name, prompt, context, use_mock=use_mock)
+        # 技术面分析指标最多、计算最耗时，给更长超时
+        agent_timeout = 120 if name == "technical_analyst" else 60
+        report = _call_llm_agent(name, prompt, context, use_mock=use_mock, timeout=agent_timeout)
         reports.append(report)
 
         # 显示提取的结构化数据摘要

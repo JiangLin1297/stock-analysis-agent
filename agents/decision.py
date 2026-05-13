@@ -352,15 +352,14 @@ def _apply_hard_rules_3d(compressed_data: dict, decision_3d: dict, adapted_param
             else:
                 d["stop_loss_price"] = round(float(boll_lower), 2) if boll_lower else round(float(price) * 0.95, 2)
 
-        # 不再强制设定固定 take_profit_price — 使用 exit_strategy 替代
+        # 本地止盈价计算（参考值，实际退出由 exit_strategy 控制）
         if d.get("take_profit_price") is None and price:
-            # 仅作为参考值保留，实际退出由 exit_strategy 控制
-            if dim == "long_term":
-                d["take_profit_price"] = None  # 不设固定止盈
-            elif dim == "mid_term":
-                d["take_profit_price"] = None
+            expected_ret = d.get("expected_return_pct")
+            fallback_mult = {"short_term": 1.03, "mid_term": 1.08, "long_term": 1.15}.get(dim, 1.05)
+            if expected_ret and expected_ret > 0:
+                d["take_profit_price"] = round(float(price) * (1 + expected_ret / 100 * 0.8), 2)
             else:
-                d["take_profit_price"] = None
+                d["take_profit_price"] = round(float(price) * fallback_mult, 2)
 
         # 确保 exit_strategy 存在
         if not d.get("exit_strategy"):
@@ -477,7 +476,7 @@ def _mock_decision_3d(compressed_data: dict, agent_reports: list[dict],
             "action": short_action, "entry_price": round(float(price), 2) if price else None,
             "stop_loss_price": round(float(boll_lower), 2) if boll_lower else (
                 round(float(price) * 0.96, 2) if price else None),
-            "take_profit_price": None,
+            "take_profit_price": round(float(price) * 1.03, 2) if price else None,
             "position_pct": ap_short.get("position_pct", 19), "confidence": round(short_conf, 2),
             "rationale": f"短线{short_action}，基于技术面信号和资金动量",
             "expected_return_pct": short_expected,
@@ -489,7 +488,7 @@ def _mock_decision_3d(compressed_data: dict, agent_reports: list[dict],
             "action": mid_action, "entry_price": round(float(price), 2) if price else None,
             "stop_loss_price": round(float(boll_lower), 2) if boll_lower else (
                 round(float(price) * 0.90, 2) if price else None),
-            "take_profit_price": None,
+            "take_profit_price": round(float(price) * 1.08, 2) if price else None,
             "position_pct": ap_mid.get("position_pct", 18), "confidence": round(mid_conf, 2),
             "rationale": f"中线{mid_action}，基于趋势和行业轮动判断",
             "expected_return_pct": mid_expected,
@@ -501,7 +500,7 @@ def _mock_decision_3d(compressed_data: dict, agent_reports: list[dict],
             "action": long_action, "entry_price": round(float(price), 2) if price else None,
             "stop_loss_price": round(float(boll_lower) * 0.85, 2) if boll_lower else (
                 round(float(price) * 0.80, 2) if price else None),
-            "take_profit_price": None,
+            "take_profit_price": round(float(price) * 1.15, 2) if price else None,
             "position_pct": ap_long.get("position_pct", 25), "confidence": round(long_conf, 2),
             "rationale": f"长线{long_action}，基于成长性和行业前景判断",
             "potential_multiplier": multiplier,
@@ -681,7 +680,12 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         print(card_dual("Entry", d_entry, "Stop", d_stop, width=HALF_W))
         print(card_dual("Conf", d_conf, "Exp.Ret", f"{d_expected}%", width=HALF_W))
         if factor_score is not None:
-            print(card_line(f"因子评分: {factor_score:.0f}/100", width=HALF_W))
+            cats = dim.get("category_scores", {})
+            if cats:
+                cat_str = " | ".join(f"{k[:2]}{v:.0f}" for k, v in cats.items())
+                print(card_line(f"因子评分: {factor_score:.0f}/100 [{cat_str}]", width=HALF_W))
+            else:
+                print(card_line(f"因子评分: {factor_score:.0f}/100", width=HALF_W))
         if pm:
             print(card_line(f"潜力: {pm}", width=HALF_W))
         print(card_line(f"{d_rationale}", width=HALF_W))
@@ -866,6 +870,10 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
 
     position_pct = round(position_pct, 0)
 
+    # BUY 信号最低仓位保障（MA+RSI 触发时 score 可能很低）
+    if signal in ("BUY", "CAUTIOUS_BUY") and position_pct < 10:
+        position_pct = 10
+
     # 波动率调整：高波动降仓
     if compressed_data:
         vol = compressed_data.get("technical", {}).get("volatility_20d")
@@ -934,16 +942,34 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
 
     final_action = override_action if override_action else signal
 
+    # ── 止盈价计算 ──
+    take_profit = None
+    if price:
+        expected_ret = {"short": 10, "mid": 30, "long": 200}.get(tf, 15)
+        fallback_mult = {"short": 1.03, "mid": 1.08, "long": 1.15}.get(tf, 1.05)
+        take_profit = round(float(price) * (1 + expected_ret / 100 * 0.8), 2) if expected_ret else round(float(price) * fallback_mult, 2)
+
     # ── 构建输出 ──
+    contributions = composite.get("contributions", {})
+    category_scores = composite.get("category_scores", {})
+
+    # 因子贡献 Top5（用于回测日志和显示）
+    top_contribs = sorted(
+        ((k, v) for k, v in contributions.items() if not k.startswith("_") and v != 0),
+        key=lambda x: abs(x[1]), reverse=True
+    )[:5]
+    contrib_str = "; ".join(f"{k}={v:+.1f}" for k, v in top_contribs)
+
     decision = {
         "action": final_action,
         "entry_price": round(float(price), 2) if price else None,
         "stop_loss_price": stop_loss,
-        "take_profit_price": None,
+        "take_profit_price": take_profit,
         "position_pct": int(position_pct),
         "confidence": round(min(0.95, 0.5 + score_strength * 0.3), 2),
         "rationale": f"因子评分{score:.0f}/100(阈值{threshold})→{final_action}"
-                     + (f" [{override_reason}]" if override_reason else ""),
+                     + (f" [{override_reason}]" if override_reason else "")
+                     + (f" [{contrib_str}]" if contrib_str else ""),
         "expected_return_pct": {
             "short": 10, "mid": 30, "long": 200
         }.get(tf, 15) if final_action in ("BUY", "CAUTIOUS_BUY") else 0,
@@ -957,7 +983,9 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         },
         "_factor_driven": True,
         "_factor_score": score,
-        "_factor_contributions": composite.get("contributions", {}),
+        "_factor_contributions": contributions,
+        "contributions": contributions,
+        "category_scores": category_scores,
     }
 
     return decision
@@ -967,6 +995,7 @@ def generate_3d_factor_signals(symbol: str, compressed_data: dict = None,
                                 portfolio_context: dict = None) -> dict:
     """
     为三线（短/中/长）各自生成因子信号。
+    使用攻击性四因子权重体系: 主力痕迹(30%) + 热点引擎(25%) + 未来空间(20%) + 质量底线(25%)
 
     Returns:
         {"short_term": {...}, "mid_term": {...}, "long_term": {...}, "overall_verdict": "..."}
@@ -991,7 +1020,7 @@ def generate_3d_factor_signals(symbol: str, compressed_data: dict = None,
     tf_name_map = {"short": "short_term", "mid": "mid_term", "long": "long_term"}
     decisions = {}
     for tf_key in ["short", "mid", "long"]:
-        comp = composite_score(factors, tf_key)
+        comp = composite_score(factors, tf_key, weight_profile="aggressive")
         decision = generate_factor_signal(symbol, comp, market_state,
                                           portfolio_context, compressed_data)
         decision["timeframe"] = tf_key
@@ -1001,9 +1030,9 @@ def generate_3d_factor_signals(symbol: str, compressed_data: dict = None,
     actions = [d.get("action", "HOLD") for d in [decisions.get("short_term", {}),
                                                    decisions.get("mid_term", {}),
                                                    decisions.get("long_term", {})]]
-    best_score = max(composite_score(factors, "short")["score"],
-                     composite_score(factors, "mid")["score"],
-                     composite_score(factors, "long")["score"])
+    best_score = max(composite_score(factors, "short", weight_profile="aggressive")["score"],
+                     composite_score(factors, "mid", weight_profile="aggressive")["score"],
+                     composite_score(factors, "long", weight_profile="aggressive")["score"])
 
     decisions["overall_verdict"] = (
         f"因子模型: 短线{actions[0]}/中线{actions[1]}/长线{actions[2]}"

@@ -143,433 +143,122 @@ def _resolve_file(file_part: str, project_dir: str) -> str:
     return target if os.path.exists(target) else None
 
 
-def _apply_fix_to_weights(desc: str, project_dir: str) -> bool:
-    """
-    Parse and apply a fix instruction targeting factor_weights.json.
-
-    The file structure is: {"short": {"factor": weight, "threshold": N}, "mid": {...}, "long": {...}}
-
-    Supported formats:
-      - short.momentum_20d: 0.20 → 0.25
-      - mid.threshold: 60 → 55
-      - short.momentum_20d += 0.05
-      - mid.threshold -= 5
-      - Increase momentum_20d weight for short from 0.20 to 0.25
-      - Lower short threshold from 55 to 50
-    """
-    weights_path = os.path.join(project_dir, "factor_weights.json")
-    if not os.path.exists(weights_path):
-        return False
-
-    try:
-        with open(weights_path, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)
-    except Exception:
-        return False
-
-    backup_file(weights_path)
-    modified = False
-    TF_NAMES = {"short", "mid", "long"}
-
-    # Format A: tf.key: old_val → new_val  (e.g. "short.momentum_20d: 0.20 → 0.25" or "mid.threshold: 60 → 55")
-    m = re.search(r'(short|mid|long)\.(\w+)\s*:\s*([\d.]+)\s*→\s*([\d.]+)', desc)
-    if m:
-        tf = m.group(1)
-        key = m.group(2)
-        new_val = float(m.group(4))
-        if tf in cfg and key in cfg[tf]:
-            old_val = cfg[tf][key]
-            cfg[tf][key] = new_val
-            log(f"  🔧 factor_weights: {tf}.{key} {old_val} → {new_val}")
-            modified = True
-
-    # Format B: tf.key += delta or tf.key -= delta
-    if not modified:
-        m = re.search(r'(short|mid|long)\.(\w+)\s*([+\-]=)\s*([\d.]+)', desc)
-        if m:
-            tf = m.group(1)
-            key = m.group(2)
-            op = m.group(3)
-            delta = float(m.group(4))
-            if tf in cfg and key in cfg[tf]:
-                old_val = cfg[tf][key]
-                if op == "+=":
-                    cfg[tf][key] = round(old_val + delta, 4)
-                else:
-                    cfg[tf][key] = round(max(0, old_val - delta), 4)
-                log(f"  🔧 factor_weights: {tf}.{key} {old_val} {op} {delta} → {cfg[tf][key]}")
-                modified = True
-
-    # Format C: natural language — "Increase/Lower <factor> weight for <tf> from X to Y"
-    if not modified:
-        m = re.search(r'(?:Increase|Raise|Boost|Lower|Reduce|Decrease)\s+(\w+)\s+(?:weight|threshold)\s+(?:for|in)\s+(\w+)[\s\w]*from\s+([\d.]+)\s+to\s+([\d.]+)', desc, re.IGNORECASE)
-        if m:
-            factor = m.group(1).lower()
-            tf_word = m.group(2).lower()
-            new_val = float(m.group(4))
-            tf_map = {"short": "short", "mid": "mid", "long": "long",
-                      "短线": "short", "中线": "mid", "长线": "long"}
-            tf = tf_map.get(tf_word, tf_word)
-            if tf in cfg and factor in cfg[tf]:
-                old_val = cfg[tf][factor]
-                cfg[tf][factor] = new_val
-                log(f"  🔧 factor_weights: {tf}.{factor} {old_val} → {new_val}")
-                modified = True
-
-    # Format D: Chinese natural language — "权重/阈值: factor tf 从 X 到 Y"
-    if not modified:
-        m = re.search(r'(?:权重|weight|阈值|threshold)\s*[：:]\s*(\w+)\s*(?:(\w+)\s*)?从\s*([\d.]+)\s*(?:→|到|调整为?|改为)\s*([\d.]+)', desc)
-        if m:
-            key = m.group(1)
-            tf_hint = m.group(2) or ""
-            new_val = float(m.group(4))
-            tf_map = {"short": "short", "mid": "mid", "long": "long",
-                      "短线": "short", "中线": "mid", "长线": "long"}
-            tf = tf_map.get(tf_hint, None)
-            if tf and tf in cfg and key in cfg[tf]:
-                old_val = cfg[tf][key]
-                cfg[tf][key] = new_val
-                log(f"  🔧 factor_weights: {tf}.{key} {old_val} → {new_val}")
-                modified = True
-            elif not tf:
-                # Search all timeframes
-                for t in TF_NAMES:
-                    if key in cfg[t]:
-                        old_val = cfg[t][key]
-                        cfg[t][key] = new_val
-                        log(f"  🔧 factor_weights: {t}.{key} {old_val} → {new_val}")
-                        modified = True
-                        break
-
-    if modified:
-        try:
-            with open(weights_path, 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-            FILE_MOD_COUNT[weights_path] += 1
-            return True
-        except Exception:
-            return False
-
-    return False
-
-
-def _apply_fix_via_deepseek(instruction: str, target_file: str, project_dir: str) -> bool:
-    """通过 DeepSeek 将自然语言修改指令翻译为代码 diff 并应用。
-
-    流程:
-      1. 读取目标文件内容
-      2. 发送指令 + 文件内容给 DeepSeek，要求返回修改后的完整代码
-      3. 验证语法（py_compile）
-      4. 先在 .bak 文件上测试，确认无误后覆盖原文件
-    """
-    try:
-        from data.deepseek import deepseek_chat
-    except ImportError:
-        log("  ⚠ DeepSeek 模块不可用，跳过 NL 翻译")
-        return False
-
-    if not os.path.isfile(target_file):
-        log(f"  ⚠ 目标文件不存在: {target_file}")
-        return False
-
-    try:
-        with open(target_file, 'r', encoding='utf-8') as f:
-            original_content = f.read()
-    except Exception as e:
-        log(f"  ⚠ 读取文件失败: {e}")
-        return False
-
-    filename = os.path.basename(target_file)
-    prompt = f"""你是一个精确的 Python 代码修改助手。请根据以下修改指令，对文件 `{filename}` 进行精确修改。
-
-## 修改指令
-{instruction}
-
-## 当前文件完整内容
-```python
-{original_content}
-```
-
-## 要求
-1. 只修改与指令相关的代码，不要改动其他部分
-2. 返回修改后的 **完整文件内容**，用以下标记包裹：
-<<<MODIFIED_FILE_START>>>
-（修改后的完整 Python 代码）
-<<<MODIFIED_FILE_END>>>
-3. 不要添加任何解释文字，只返回标记包裹的代码
-4. 确保修改后的代码语法正确"""
-
-    try:
-        response = deepseek_chat(prompt, temperature=0.1)
-    except Exception as e:
-        log(f"  ⚠ DeepSeek 调用失败: {e}")
-        return False
-
-    if not response:
-        log("  ⚠ DeepSeek 返回为空")
-        return False
-
-    # 提取修改后的代码
-    m = re.search(
-        r'<<<MODIFIED_FILE_START>>>(.*?)<<<MODIFIED_FILE_END>>>',
-        response, re.DOTALL
-    )
-    if not m:
-        log("  ⚠ DeepSeek 返回格式不符（缺少标记），跳过")
-        log(f"    原始响应前200字: {response[:200]}")
-        return False
-
-    new_content = m.group(1).strip()
-    # 去除可能的 markdown 代码块标记
-    if new_content.startswith("```python"):
-        new_content = new_content[len("```python"):].strip()
-    elif new_content.startswith("```"):
-        new_content = new_content[3:].strip()
-    if new_content.endswith("```"):
-        new_content = new_content[:-3].strip()
-
-    if new_content == original_content:
-        log(f"  ℹ DeepSeek 未修改 {filename}（内容相同）")
-        return False
-
-    # 语法验证
-    import py_compile
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False,
-                                     encoding='utf-8') as tmp:
-        tmp.write(new_content)
-        tmp_path = tmp.name
-    try:
-        py_compile.compile(tmp_path, doraise=True)
-    except py_compile.PyCompileError as e:
-        log(f"  ⚠ DeepSeek 返回的代码语法错误: {e}")
-        os.unlink(tmp_path)
-        return False
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-    # 备份原文件
-    backup_file(target_file)
-
-    # 先写入备份路径做最终确认
-    bak_path = target_file + ".bak"
-    try:
-        with open(bak_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        # 确认备份可读
-        with open(bak_path, 'r', encoding='utf-8') as f:
-            verify = f.read()
-        if verify != new_content:
-            log("  ⚠ 备份文件验证失败")
-            return False
-    except Exception as e:
-        log(f"  ⚠ 写入备份失败: {e}")
-        return False
-
-    # 覆盖原文件
-    try:
-        with open(target_file, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        FILE_MOD_COUNT[target_file] += 1
-        log(f"  ✅ DeepSeek 修改成功: {filename}")
-        return True
-    except Exception as e:
-        log(f"  ⚠ 覆盖原文件失败: {e}")
-        # 尝试从备份恢复
-        try:
-            shutil.copy2(bak_path, target_file)
-        except Exception:
-            pass
-        return False
-
-
 # ═══════════════════════════════════════════════════════════════
 # 项目根目录（从本文件位置推导，不依赖调用方传入）
 # ═══════════════════════════════════════════════════════════════
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _verify_write(target_file: str, expected_marker: str) -> bool:
-    """验证文件写入成功：重新读取文件，确认 expected_marker 存在。"""
-    try:
-        with open(target_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-        if expected_marker in content:
-            return True
-        log(f"  ⚠ [写入验证失败] {os.path.basename(target_file)}: 未找到 '{expected_marker[:50]}'")
+def _set_json_value(data: dict, dot_path: str, new_value) -> bool:
+    """按点分隔路径设置 JSON 值。例如 "short.threshold" → data["short"]["threshold"] = new_value。"""
+    keys = dot_path.split(".")
+    obj = data
+    for k in keys[:-1]:
+        if not isinstance(obj, dict) or k not in obj:
+            return False
+        obj = obj[k]
+    final_key = keys[-1]
+    if not isinstance(obj, dict) or final_key not in obj:
         return False
-    except Exception as e:
-        log(f"  ⚠ [写入验证异常] {e}")
-        return False
+    obj[final_key] = new_value
+    return True
 
 
-def _find_file_fallback(file_rel: str, func_name: str, old_code: str, project_dir: str) -> str:
-    """当 Critic 指定的文件不存在时，尝试定位实际包含目标代码的文件。"""
-    # 1. 尝试原始路径
-    target = _resolve_file(file_rel, project_dir)
-    if target:
-        return target
-    target = _resolve_file(file_rel, _PROJECT_ROOT)
-    if target:
-        return target
-
-    # 2. 按 function 名搜索：在所有 .py 文件中查找 'def func_name('
-    if func_name:
-        import glob as _glob
-        for py_file in _glob.glob(os.path.join(project_dir, "**", "*.py"), recursive=True):
-            try:
-                with open(py_file, 'r', encoding='utf-8') as f:
-                    txt = f.read()
-                if f"def {func_name}(" in txt:
-                    return py_file
-            except Exception:
-                continue
-
-    # 3. 按 old_code 内容搜索：在所有 .py 和 .json 文件中查找 old_code
-    if old_code:
-        import glob as _glob
-        for pattern in ["**/*.py", "**/*.json"]:
-            for fpath in _glob.glob(os.path.join(project_dir, pattern), recursive=True):
-                if '__pycache__' in fpath:
-                    continue
-                try:
-                    with open(fpath, 'r', encoding='utf-8') as f:
-                        txt = f.read()
-                    if old_code in txt:
-                        return fpath
-                except Exception:
-                    continue
-
-    # 4. 常见文件名映射兜底
-    basename = os.path.basename(file_rel).replace('.py', '')
-    _ALIASES = {
-        "hybrid_agent": ["analysis/holding.py", "agents/decision.py"],
-        "holding_evaluator": ["analysis/holding.py"],
-        "decision_engine": ["agents/decision.py"],
-        "risk_manager": ["agents/decision.py", "analysis/holding.py"],
-        "time_frame_runner": ["agents/decision.py", "agents/runner.py"],
-        "agent_prompts": ["agents/prompts.py"],
-    }
-    for alias, candidates in _ALIASES.items():
-        if alias in basename:
-            for c in candidates:
-                target = _resolve_file(c, project_dir)
-                if target:
-                    return target
-
-    return None
-
-
-def _apply_code_changes(code_changes: list, project_dir: str) -> int:
-    """执行 Critic 返回的 JSON 代码修改指令。
-
-    每条指令格式:
-      {"file": "相对路径", "function": "函数名", "old_code": "原代码", "new_code": "新代码", "reason": "原因"}
-
-    当 Critic 指定的文件不存在时，自动搜索包含目标代码的实际文件。
-    返回成功执行的修改数量。
-    """
-    applied = 0
-
-    for i, change in enumerate(code_changes):
-        if not isinstance(change, dict):
-            continue
-
-        file_rel = change.get("file", "")
-        old_code = change.get("old_code", "")
-        new_code = change.get("new_code", "")
-        reason = change.get("reason", "")
-        func_name = change.get("function", "")
-
-        if not old_code or not new_code:
-            log(f"  ⚠ [代码修改 {i+1}] 缺少 old_code/new_code，跳过")
-            continue
-
-        if old_code == new_code:
-            continue
-
-        # 解析目标文件（含智能兜底）
-        target_file = _find_file_fallback(file_rel, func_name, old_code, project_dir)
-        if not target_file:
-            log(f"  ⚠ [代码修改 {i+1}] 找不到目标文件: {file_rel} (func={func_name})")
-            continue
-
-        # 读取文件
-        try:
-            with open(target_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except Exception as e:
-            log(f"  ⚠ [代码修改 {i+1}] 读取失败: {e}")
-            continue
-
-        # 搜索 old_code（精确匹配 + 去空白模糊匹配）
-        if old_code not in content:
-            # 模糊匹配：去掉首尾空白后比较
-            stripped_old = old_code.strip()
-            if stripped_old not in content:
-                log(f"  ⚠ [代码修改 {i+1}] old_code 未匹配: {os.path.basename(target_file)}:{func_name}")
-                log(f"    搜索: {old_code[:60]}...")
-                continue
-            old_code = stripped_old
-
-        # 替换（只替换第一次出现）
-        new_content = content.replace(old_code, new_code, 1)
-
-        # 写入
-        backup_file(target_file)
-        try:
-            with open(target_file, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-        except Exception as e:
-            log(f"  ⚠ [代码修改 {i+1}] 写入失败: {e}")
-            continue
-
-        # 验证
-        if not _verify_write(target_file, new_code):
-            log(f"  ⚠ [代码修改 {i+1}] 写入验证失败")
-            continue
-
-        applied += 1
-        FILE_MOD_COUNT[target_file] += 1
-        log(f"  [Critic生效] {os.path.basename(target_file)}:{func_name} — {reason}")
-        log(f"    旧: {old_code[:80]}")
-        log(f"    新: {new_code[:80]}")
-
-    return applied
-
-
-def _save_pending_fix(instruction: str, project_dir: str):
-    """将无法自动执行的建议写入 pending_fixes.txt，不阻塞进化流程。"""
-    pending_path = os.path.join(project_dir, "pending_fixes.txt")
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    try:
-        with open(pending_path, 'a', encoding='utf-8') as f:
-            f.write(f"[{timestamp}] {instruction}\n")
-        log(f"  📝 未匹配建议已写入 pending_fixes.txt: {instruction[:60]}")
-    except Exception:
-        log(f"  ⚠ 写入 pending_fixes.txt 失败")
-
-
-def apply_fix(code_changes: list, project_dir: str) -> bool:
-    """执行 Critic 输出的 JSON 代码修改指令。这是唯一的修改入口。
+def apply_fix(critic_json: dict) -> int:
+    """解析 Critic 输出的 JSON 中的 operations 数组，逐条执行文件修改。
 
     Args:
-        code_changes: Critic 输出的 code_changes 列表，每项为 dict:
-            {"file": "相对路径", "function": "函数名", "old_code": "原代码", "new_code": "新代码", "reason": "原因"}
-        project_dir: 项目根目录
+        critic_json: Critic 输出的完整 dict，需包含 "operations" 数组。
+            每条 operation: {"file": "路径", "target": "键名或变量名", "new_value": 新值}
 
     Returns:
-        True 表示至少有一条修改成功
+        成功修改的条数。
     """
-    if not code_changes:
-        log("  无修改指令")
-        return False
+    operations = critic_json.get("operations")
+    if not operations:
+        print("无可用修改指令")
+        return 0
 
-    applied = _apply_code_changes(code_changes, project_dir)
-    if applied == 0:
-        log("  ⚠ 0 条 code_changes 生效（old_code 未匹配或文件不存在）")
-    return applied > 0
+    applied = 0
+    project_dir = _data_dir()
+
+    for op in operations:
+        file_rel = op.get("file", "")
+        target = op.get("target", "")
+        new_value = op.get("new_value")
+
+        if not file_rel or not target:
+            log(f"  ⚠ [operation] 缺少 file 或 target，跳过: {op}")
+            continue
+
+        # 解析文件路径
+        target_file = _resolve_file(file_rel, project_dir)
+        if not target_file:
+            target_file = _resolve_file(file_rel, _PROJECT_ROOT)
+        if not target_file:
+            log(f"  ⚠ [operation] 文件不存在: {file_rel}")
+            continue
+
+        if file_rel.endswith(".json"):
+            # JSON 文件：按点分隔路径找到键，修改值
+            try:
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                log(f"  ⚠ [operation] 读取 JSON 失败: {file_rel} — {e}")
+                continue
+
+            if not _set_json_value(data, target, new_value):
+                log(f"  ⚠ [operation] 路径不存在: {file_rel}:{target}")
+                continue
+
+            backup_file(target_file)
+            try:
+                with open(target_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                log(f"  ⚠ [operation] 写入 JSON 失败: {file_rel} — {e}")
+                continue
+
+            FILE_MOD_COUNT[target_file] += 1
+            log(f"  [Critic生效] {file_rel}:{target} = {new_value}")
+            applied += 1
+
+        elif file_rel.endswith(".py"):
+            # Python 文件：正匹配合 target = 数值，替换为新值
+            try:
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except Exception as e:
+                log(f"  ⚠ [operation] 读取 Python 失败: {file_rel} — {e}")
+                continue
+
+            pattern = r'\b' + re.escape(target) + r'\s*=\s*[0-9.]+'
+            match = re.search(pattern, content)
+            if not match:
+                log(f"  ⚠ [operation] 未找到赋值语句: {file_rel}:{target}")
+                continue
+
+            replacement = f"{target} = {new_value}"
+            new_content = content[:match.start()] + replacement + content[match.end():]
+
+            backup_file(target_file)
+            try:
+                with open(target_file, 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+            except Exception as e:
+                log(f"  ⚠ [operation] 写入 Python 失败: {file_rel} — {e}")
+                continue
+
+            FILE_MOD_COUNT[target_file] += 1
+            log(f"  [Critic生效] {file_rel}:{target} = {new_value}")
+            applied += 1
+
+        else:
+            log(f"  ⚠ [operation] 不支持的文件类型: {file_rel}")
+            continue
+
+    return applied
 
 
 def run_single_backtest(symbol: str, timeframe: str, days: int = None,
@@ -644,45 +333,11 @@ def run_deep_critique(bt_result: dict) -> dict:
             )
             critic_result["deep_dive"] = deep
 
-        # 确保 code_changes 字段存在
-        if "code_changes" not in critic_result:
-            critic_result["code_changes"] = []
-
         return critic_result
     except Exception as e:
         log(f"  ⚠ Critic分析失败: {e}")
-        return {"overall_score": 0, "must_fix": [], "code_changes": [],
+        return {"overall_score": 0, "operations": [],
                 "verdict": f"Critic失败: {e}"}
-
-
-def _generate_factor_fixes(bt_result: dict) -> list:
-    """基于回测结果自动生成 factor_weights.json 修改建议。"""
-    fixes = []
-    metrics = bt_result.get("metrics", {})
-    tf = bt_result.get("timeframe", "mid")
-
-    win_rate = metrics.get("win_rate_pct", 0)
-    total_ret = metrics.get("total_return_pct", 0)
-    total_trades = metrics.get("total_trades", 0)
-
-    target = TARGETS.get(tf, TARGETS["mid"])
-
-    if tf in ("short", "mid"):
-        target_wr = target.get("win_rate_pct", 50)
-        target_ret = target.get("avg_return_pct", 10)
-        if win_rate < target_wr and total_trades > 3:
-            fixes.append(f"{tf}.threshold: 55 → 48  # 降低阈值提高信号频率 (胜率{win_rate:.0f}%<{target_wr:.0f}%)")
-        if total_trades < 5 and total_ret < target_ret:
-            fixes.append(f"{tf}.threshold: 55 → 45  # 交易太少({total_trades}笔)，放宽门槛")
-    else:
-        target_dd = target.get("max_drawdown_pct", 30)
-        max_dd = metrics.get("max_drawdown_pct", 0)
-        if max_dd > target_dd:
-            fixes.append(f"{tf}.threshold: 55 → 65  # 收紧以控制回撤({max_dd:.1f}%>{target_dd:.0f}%)")
-        if total_trades < 3 and total_ret < 20:
-            fixes.append(f"{tf}.threshold: 55 → 42  # 放宽以捕捉长期机会")
-
-    return fixes
 
 
 def check_overfitting(history: list) -> dict:
@@ -844,18 +499,40 @@ def evolve_full(max_iterations: int = 50, use_mock: bool = True, seed: int = Non
             for k, v in bt_result.get("details", {}).items():
                 log(f"     {k}: 实际={v['actual']} 目标={v['target']} {'✅' if v['pass'] else '❌'}")
 
-        # ── 4. Critic analysis ──
+        # ── 4. Critic analysis → apply_fix ──
         log(f"--- Critic深度分析 ---")
         critic = run_deep_critique(bt_result)
 
-        # 输出人工执行清单
-        must_fix = critic.get("must_fix", [])
-        if must_fix:
-            log(f"  📋 人工执行清单 ({len(must_fix)}条):")
-            for i, fix in enumerate(must_fix, 1):
-                log(f"    {i}. {fix}")
-        else:
-            log("  ⚠ Critic 未生成修改建议")
+        # 如果 Critic 返回的是旧格式 (code_changes)，转换为 operations 格式
+        if not critic.get("operations") and critic.get("code_changes"):
+            ops = []
+            for cc in critic["code_changes"]:
+                if not isinstance(cc, dict) or not cc.get("file") or not cc.get("new_code"):
+                    continue
+                file_path = cc["file"]
+                old_code = cc.get("old_code", "")
+                new_code = cc["new_code"]
+                if file_path.endswith(".json"):
+                    tf = "short"
+                    for t in ["short", "mid", "long"]:
+                        if t in cc.get("reason", ""):
+                            tf = t
+                            break
+                    m = re.search(r'"(\w+)":\s*[\d.]+', old_code)
+                    target = f"{tf}.{m.group(1)}" if m else old_code
+                    m2 = re.search(r'[\d.]+', new_code)
+                    new_value = float(m2.group()) if m2 else new_code
+                else:
+                    m = re.search(r'(\b[A-Z_][A-Z0-9_]*)\s*=', old_code)
+                    target = m.group(1) if m else cc.get("function", old_code)
+                    m2 = re.search(r'[\d.]+', new_code)
+                    new_value = float(m2.group()) if m2 else new_code
+                ops.append({"file": file_path, "target": target, "new_value": new_value})
+            if ops:
+                critic["operations"] = ops
+
+        num_applied = apply_fix(critic)
+        log(f"  本轮应用修改数: {num_applied}")
 
         # ── 5. Overfitting check (every 10 rounds) ──
         if iteration % 10 == 0:

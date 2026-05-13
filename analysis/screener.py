@@ -300,7 +300,7 @@ def _fetch_kline_indicators(symbol: str) -> dict:
         bb_upper = bb_mid + 2 * bb_std
         bb_lower = bb_mid - 2 * bb_std
         last_close = float(close.iloc[-1])
-        return {
+        indicators = {
             "close": round(last_close, 2),
             "ma5": round(float(ma5), 2) if not pd.isna(ma5) else None,
             "ma10": round(float(ma10), 2) if not pd.isna(ma10) else None,
@@ -316,8 +316,9 @@ def _fetch_kline_indicators(symbol: str) -> dict:
             "ma20_slope": ma20_slope,
             "cross_count": cross_count,
         }
+        return indicators, df
     except Exception:
-        return {}
+        return {}, pd.DataFrame()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -325,7 +326,7 @@ def _fetch_kline_indicators(symbol: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _fetch_financial_fast(symbol: str) -> dict:
-    """快速获取 ROE 和资产负债率。"""
+    """快速获取 ROE、资产负债率和营收增长。"""
     import akshare as ak
     try:
         df = ak.stock_financial_abstract(symbol=symbol)
@@ -345,6 +346,7 @@ def _fetch_financial_fast(symbol: str) -> dict:
         return {
             "roe": _get_val(["净资产收益率(ROE)", "净资产收益率"]),
             "debt_ratio": _get_val(["资产负债率"]),
+            "revenue_growth": _get_val(["营业收入增长率", "营收增长率", "营业总收入增长率"]),
         }
     except Exception:
         return {}
@@ -355,12 +357,13 @@ def _fetch_financial_fast(symbol: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _fetch_one_stock(symbol: str, spot_info: dict) -> dict:
-    """获取单个股票的完整数据（技术+财务），用于并行执行。"""
-    tech = _fetch_kline_indicators(symbol)
+    """获取单个股票的完整数据（技术+财务+原始K线），用于并行执行。"""
+    tech, kline_df = _fetch_kline_indicators(symbol)
     fin = _fetch_financial_fast(symbol)
     result = dict(spot_info)
     result.update(tech)
     result.update(fin)
+    result["_kline_df"] = kline_df
     return result
 
 
@@ -369,100 +372,36 @@ def _fetch_one_stock(symbol: str, spot_info: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _score_one(stock: dict, criteria: dict) -> tuple:
-    """对单只股票打分，返回 (score, 是否通过全部条件用于排序)。"""
-    score = 0
-    checks = {}
+    """
+    四因子模型打分，返回 (composite_score, factor_result_dict)。
+    composite_score: 0~100 综合评分
+    factor_result_dict: alpha_factors.compute_all_factors 的完整返回
+    """
+    from analysis.alpha_factors import compute_all_factors
 
-    # 技术面
-    ma5 = stock.get("ma5")
-    ma20 = stock.get("ma20")
-    checks["ma_bullish"] = (ma5 is not None and ma20 is not None and ma5 > ma20)
+    kline_df = stock.get("_kline_df")
+    if kline_df is None or len(kline_df) < 20:
+        return 0.0, {"filtered": True, "filter_reason": "K线数据不足"}
 
-    rsi = stock.get("rsi14")
-    rsi_ok = (rsi is not None and criteria["rsi_min"] <= rsi <= criteria["rsi_max"])
-    checks["rsi_range"] = rsi_ok
+    # 构建 spot 和 fin 数据
+    spot = {
+        "name": stock.get("name", ""),
+        "close": stock.get("close"),
+        "change_pct": stock.get("change_pct"),
+        "pe": stock.get("pe"),
+        "pb": stock.get("pb"),
+        "turnover": stock.get("turnover"),
+        "总市值": stock.get("总市值"),
+        "roe": stock.get("roe"),
+    }
+    fin = {
+        "roe": stock.get("roe"),
+        "debt_ratio": stock.get("debt_ratio"),
+        "revenue_growth": stock.get("revenue_growth"),
+    }
 
-    macd_hist = stock.get("macd_hist")
-    checks["macd_positive"] = (macd_hist is not None and macd_hist > 0)
-
-    # 基本面
-    pe = stock.get("pe")
-    checks["pe_range"] = (pe is not None and criteria["pe_min"] < pe < criteria["pe_max"])
-
-    pb = stock.get("pb")
-    checks["pb_range"] = (pb is not None and criteria["pb_min"] < pb < criteria["pb_max"])
-
-    roe = stock.get("roe")
-    checks["roe_min"] = (roe is not None and roe > criteria["roe_min"])
-
-    # 财务安全
-    debt = stock.get("debt_ratio")
-    checks["debt_ratio_max"] = (debt is not None and debt < criteria["debt_ratio_max"])
-
-    # 流动性
-    turnover = stock.get("turnover")
-    checks["turnover_range"] = (turnover is not None and criteria["turnover_min"] < turnover < criteria["turnover_max"])
-
-    # 趋势
-    close = stock.get("close")
-    ma60 = stock.get("ma60")
-    checks["above_ma60"] = (close is not None and ma60 is not None and close > ma60)
-
-    # 新增：换手率分层检查
-    turnover = stock.get("turnover")
-    checks["turnover_active"] = (turnover is not None and 3 < turnover < 15)
-    checks["turnover_high"] = (turnover is not None and turnover >= 15)
-
-    # 新增：近5日动量（涨幅+量比）
-    change_pct = stock.get("change_pct")
-    checks["recent_momentum"] = (change_pct is not None and change_pct > 2)
-
-    for k in SCORE_CHECKS:
-        if checks.get(k, False):
-            score += 1
-
-    # ── 收益潜力额外加分（权重50%） ──
-    # 技术面动量加分（高收益潜力）
-    if checks.get("ma_bullish"):
-        score += 2
-    if checks.get("macd_positive"):
-        score += 1
-    if checks.get("recent_momentum"):
-        score += 2
-    if checks.get("turnover_active"):
-        score += 1  # 活跃换手=短线机会
-
-    # 成长性加分（长线翻倍潜力）
-    roe = stock.get("roe")
-    if roe is not None and roe >= 12:
-        score += 2
-    if roe is not None and roe >= 20:
-        score += 1
-
-    # 成长行业加分
-    name = stock.get("name", "")
-    for kw in GROWTH_SECTORS:
-        if kw in str(name):
-            score += 1
-            break
-
-    # ── 扣分项：高PE / 高负债 / 低ROE（安全性20%）──
-    if pe is not None:
-        if pe > 50:
-            score -= 2
-        elif pe > 30:
-            score -= 1
-
-    if debt is not None:
-        if debt > 80:
-            score -= 3
-        elif debt > 60:
-            score -= 1
-
-    if roe is not None and roe < 5:
-        score -= 1
-
-    return score, checks
+    result = compute_all_factors(kline_df, spot, fin)
+    return result["composite_score"], result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -611,7 +550,7 @@ def _parse_deepseek_json(raw: str) -> dict:
 
 
 def _deepseek_enhance_screening(stocks: list) -> list:
-    """对筛选结果调用 DeepSeek 进行 LLM 增强分析。"""
+    """对筛选结果调用 DeepSeek 进行 LLM 增强分析（仅做点评，不改变排名/数量）。"""
     from agents.prompts import SCREENER_ENHANCE_PROMPT
     from data.deepseek import deepseek_chat
 
@@ -646,22 +585,34 @@ def _deepseek_enhance_screening(stocks: list) -> list:
         except Exception as e:
             stock["deepseek_signal"] = "HOLD"
             stock["deepseek_confidence"] = 0.0
-            stock["deepseek_rationale"] = f"DeepSeek调用失败: {e}"
+            stock["deepseek_rationale"] = f"AI点评不可用: {e}"
         return stock
 
-    # 并行调用 DeepSeek
-    enhanced = []
+    # 为每只股票设置默认 LLM 字段（防止后续读取 KeyError）
+    for s in stocks:
+        s.setdefault("deepseek_signal", "HOLD")
+        s.setdefault("deepseek_confidence", 0.0)
+        s.setdefault("deepseek_rationale", "")
+
+    # 并行调用 DeepSeek，失败的股票保留原始数据不丢弃
+    results = {}
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_analyze_one, s): s.get("symbol", "") for s in stocks}
         for future in as_completed(futures):
+            sym = futures[future]
             try:
-                enhanced.append(future.result(timeout=35))
+                results[sym] = future.result(timeout=35)
             except Exception:
-                pass
+                pass  # 该股票结果不在 results 中，用原始数据兜底
 
-    # 恢复原始排序
-    order = {s.get("symbol", ""): i for i, s in enumerate(stocks)}
-    enhanced.sort(key=lambda x: order.get(x.get("symbol", ""), 9999))
+    # 合并：LLM 成功的用 LLM 结果，失败的保留原始 stock（已有默认字段）
+    enhanced = []
+    for s in stocks:
+        sym = s.get("symbol", "")
+        if sym in results:
+            enhanced.append(results[sym])
+        else:
+            enhanced.append(s)  # LLM 失败，原始股票照常输出
     return enhanced
 
 
@@ -670,31 +621,31 @@ def _deepseek_enhance_screening(stocks: list) -> list:
 # ═══════════════════════════════════════════════════════════════
 
 def screen_stocks(market: str = "A", criteria: dict = None,
-                  scope: str = "hs300", top_n: int = 20,
+                  scope: str = "hs300", top_n: int = 5,
                   sector: str = None, use_mock: bool = False) -> list:
     """
-    智能选股主函数。
+    四因子攻击性选股主函数。
+
+    因子体系: 主力痕迹(35%) + 热点引擎(30%) + 未来空间(20%) + 基本质量(15%)
+    硬性过滤: ST股、负债率>90%直接剔除
+    默认输出 Top 5，DeepSeek 为可选增强层（不改变排名）。
 
     Args:
         market: 市场类型，默认 "A" (A股)
-        criteria: 自定义筛选条件 dict，会与 DEFAULT_CRITERIA 合并
+        criteria: 自定义筛选条件 dict（保留兼容，不再影响核心逻辑）
         scope: 扫描范围 — "hs300"(沪深300) / "zz500"(中证500)
-        top_n: 返回前 N 只评分最高的股票
-        sector: 可选行业过滤，如 "新能源"（暂用名称关键词匹配）
-        use_mock: False=调用DeepSeek增强分析, True=纯本地打分
+        top_n: 返回前 N 只评分最高的股票（默认5）
+        sector: 可选行业过滤，如 "新能源"
+        use_mock: True=跳过DeepSeek分析, False=附加AI点评（不改变排名）
 
     Returns:
-        list[dict]: 按 score 降序排列的股票列表（最多 top_n 只）
+        list[dict]: 按 composite_score 降序排列的股票列表
     """
-    import akshare as ak
-
-    crit = dict(DEFAULT_CRITERIA)
-    if criteria:
-        crit.update(criteria)
 
     print(f"\n{'='*60}")
     scope_name = INDEX_SCOPE.get(scope, ("", "沪深300"))[1]
-    print(f"  智能选股 — 范围: {scope_name} | 返回 Top {top_n}")
+    print(f"  四因子选股 — 范围: {scope_name} | 返回 Top {top_n}")
+    print(f"  因子: 主力痕迹(35%) + 热点引擎(30%) + 未来空间(20%) + 基本质量(15%)")
     print(f"{'='*60}\n")
 
     # ── Step 1: 获取成分股 ──
@@ -709,13 +660,12 @@ def screen_stocks(market: str = "A", criteria: dict = None,
     spots = _get_spot_batch(symbols)
     print(f"  覆盖 {len(spots)}/{len(symbols)} 只成分股")
 
-    # 只分析在 spot 中存在的
     candidates = [s for s in symbols if s in spots]
     if not candidates:
         print("  ✗ 无有效行情数据")
         return []
 
-    # ── Step 3: 并行抓取每只股票的技术+财务数据 ──
+    # ── Step 3: 并行抓取技术+财务数据 ──
     print(f"\n[3/4] 并行获取技术指标+财务数据 (max_workers={MAX_WORKERS})...")
     results = []
     completed = 0
@@ -733,31 +683,40 @@ def screen_stocks(market: str = "A", criteria: dict = None,
             try:
                 data = future.result(timeout=TIMEOUT_SINGLE + 5)
                 results.append(data)
-            except Exception as e:
-                # 单只股票失败不中断整体流程
+            except Exception:
                 pass
             if completed % 10 == 0 or completed == total:
                 print(f"  抓取进度: {completed}/{total}")
 
     print(f"  成功获取 {len(results)} 只股票的完整数据")
 
-    # ── Step 4: 打分、过滤、排序 ──
-    print(f"\n[4/4] 打分 & 排序...")
+    # ── Step 4: 四因子打分 ──
+    print(f"\n[4/4] 四因子打分 & 排序...")
     scored = []
+    filtered_count = 0
     for i, stock in enumerate(results):
-        score, checks = _score_one(stock, crit)
+        score, factor_result = _score_one(stock, criteria or {})
         sym = stock.get("symbol", "?")
         name = stock.get("name", "")
-        # 逐只输出进度
-        verdict = "✅" if score >= 5 else ("📈" if score >= 3 else "❌")
-        print(f"  [{i+1}/{len(results)}] {sym} {name} → 评分 {score} {verdict}")
-        # 过滤条件：至少满足 3 项以上才纳入
-        if score >= 3:
-            stock["score"] = score
-            stock["checks"] = checks
-            scored.append(stock)
 
-    # 去重（同一 symbol 只保留第一条）
+        if factor_result.get("filtered"):
+            filtered_count += 1
+            if i < 5 or i % 50 == 0:
+                reason = factor_result.get("filter_reason", "")
+                print(f"  [{i+1}/{len(results)}] {sym} {name} → 过滤: {reason}")
+            continue
+
+        tags = factor_result.get("signal_tags", [])
+        tag_str = " | ".join(tags[:3])
+        verdict = "★" if score >= 60 else ("☆" if score >= 45 else "·")
+        print(f"  [{i+1}/{len(results)}] {sym} {name} → {score:.1f}分 {verdict} [{tag_str}]")
+
+        stock["composite_score"] = score
+        stock["factor_result"] = factor_result
+        stock["signal_tags"] = tags
+        scored.append(stock)
+
+    # 去重
     seen = set()
     scored_dedup = []
     for s in scored:
@@ -767,37 +726,34 @@ def screen_stocks(market: str = "A", criteria: dict = None,
             scored_dedup.append(s)
     scored = scored_dedup
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
+    scored.sort(key=lambda x: x["composite_score"], reverse=True)
+    print(f"\n  过滤: {filtered_count} 只 | 有效打分: {len(scored)} 只")
 
     top_stocks = scored[:top_n]
 
     # ── 行业过滤（如指定） ──
     if sector and top_stocks:
         filtered = [s for s in top_stocks if sector in (s.get("name") or "")]
-        # 如果关键词过滤后不足，用未过滤的补足
         if len(filtered) < top_n:
             remaining = [s for s in scored if s not in filtered]
             filtered.extend(remaining[: top_n - len(filtered)])
         top_stocks = filtered[:top_n]
 
-    # ── DeepSeek 增强分析 ──
+    # ── DeepSeek 增强分析（仅做点评，不改变排名和数量） ──
     if not use_mock:
-        print(f"\n  [LLM增强] 调用 DeepSeek V4 Pro 分析 {len(top_stocks)} 只候选股票...")
-        top_stocks = _deepseek_enhance_screening(top_stocks)
-        print(f"  [LLM增强] 完成")
+        print(f"\n  [AI点评] 调用 DeepSeek 分析 {len(top_stocks)} 只候选...")
+        enhanced = _deepseek_enhance_screening(top_stocks)
+        if len(enhanced) >= len(top_stocks):
+            top_stocks = enhanced
+        # LLM 结果为空或数量不足时，保留原始 top_stocks 不替换
+        print(f"  [AI点评] 完成")
 
     # ── 格式化输出 ──
     printable = []
     for s in top_stocks:
         entry = _calc_entry_price(s)
-        # 计算收益潜力标注
-        close_val = s.get("close")
-        roe_val = s.get("roe")
-        rev_g = s.get("revenue_growth")  # may be None
-
-        short_potential = "≥10%" if (checks.get("ma_bullish") and checks.get("macd_positive") and checks.get("recent_momentum")) else "<10%"
-        mid_potential = "≥30%" if (checks.get("ma_bullish") and roe_val and roe_val >= 10) else "<30%"
-        long_multiple = "2-3x" if (roe_val and roe_val >= 15) else ("3-5x" if (roe_val and roe_val >= 20) else "<2x")
+        factor_result = s.get("factor_result", {})
+        cat_scores = factor_result.get("category_scores", {})
 
         printable.append({
             "symbol": s.get("symbol", ""),
@@ -808,11 +764,16 @@ def screen_stocks(market: str = "A", criteria: dict = None,
             "pb": s.get("pb"),
             "roe": s.get("roe"),
             "debt_ratio": s.get("debt_ratio"),
-            "ma5": s.get("ma5"),
-            "ma20": s.get("ma20"),
-            "rsi": s.get("rsi14"),
             "turnover": s.get("turnover"),
-            "score": s["score"],
+            "composite_score": s["composite_score"],
+            "score": s["composite_score"],  # 向后兼容
+            "category_scores": {
+                "主力痕迹": round(cat_scores.get("主力痕迹", 0) * 100, 1),
+                "热点引擎": round(cat_scores.get("热点引擎", 0) * 100, 1),
+                "未来空间": round(cat_scores.get("未来空间", 0) * 100, 1),
+                "基本质量": round(cat_scores.get("基本质量", 0) * 100, 1),
+            },
+            "signal_tags": s.get("signal_tags", []),
             "entry_price": entry["entry_price"],
             "entry_range": entry["entry_range"],
             "stop_loss": entry["stop_loss"],
@@ -822,11 +783,6 @@ def screen_stocks(market: str = "A", criteria: dict = None,
             "deepseek_signal": s.get("deepseek_signal"),
             "deepseek_confidence": s.get("deepseek_confidence"),
             "deepseek_rationale": s.get("deepseek_rationale"),
-            "profit_potential": {
-                "short": short_potential,
-                "mid": mid_potential,
-                "long": long_multiple,
-            },
         })
 
     print(f"\n  最终筛选出 {len(printable)} 只潜力股\n")
@@ -839,7 +795,7 @@ def screen_stocks(market: str = "A", criteria: dict = None,
 
 def validate_screening(days: int = 60, top_n: int = 5, scope: str = "hs300") -> dict:
     """
-    对智能选股Top N进行模拟跟踪验证。
+    对四因子选股Top N进行模拟跟踪验证。
 
     记录推荐日价格，days天后计算实际收益，统计Top N平均收益是否≥15%。
 
@@ -847,13 +803,11 @@ def validate_screening(days: int = 60, top_n: int = 5, scope: str = "hs300") -> 
         {"passed": bool, "avg_return_pct": float, "stocks": [...], "recommend_date": str}
     """
     from data.pipeline import download_full_history, normalize_symbol
-    import pandas as pd
 
     print(f"\n{'='*60}")
-    print(f"  智能选股验证 — {days}天跟踪 | Top {top_n}")
+    print(f"  四因子选股验证 — {days}天跟踪 | Top {top_n}")
     print(f"{'='*60}\n")
 
-    # 1. 当前选股
     stocks = screen_stocks(scope=scope, top_n=top_n, use_mock=True)
     if not stocks:
         print("  ✗ 选股无结果")
@@ -870,23 +824,16 @@ def validate_screening(days: int = 60, top_n: int = 5, scope: str = "hs300") -> 
             results.append({"symbol": sym, "name": name, "recommend_price": None, "error": "无推荐价"})
             continue
 
-        # 2. 查找 days 天前的价格作为模拟"买入价"（使用历史数据反推验证）
-        # 实际场景：记录当前推荐，days天后再检查。此处用历史缓存数据模拟
         try:
             sym_norm, _ = normalize_symbol(sym)
             cache_path = download_full_history(sym, ndays=800)
 
-            # For actual validation we'd wait `days` days. For now, check if we
-            # have enough historical data to backtest the recommendation.
             df = pd.read_csv(cache_path)
             df['date'] = pd.to_datetime(df['date'])
 
-            # Use the most recent price data available
             latest = df.iloc[-1]
             current_price = float(latest['close'])
 
-            # Simulate: if we recommended `days` ago, what would be the return?
-            # Find the price from `days` trading days ago
             if len(df) >= days:
                 past_idx = max(0, len(df) - days - 1)
                 past_price = float(df.iloc[past_idx]['close'])
@@ -899,20 +846,15 @@ def validate_screening(days: int = 60, top_n: int = 5, scope: str = "hs300") -> 
                 "name": name,
                 "recommend_price": rec_price,
                 "current_price": current_price,
-                "score": s.get("score", 0),
-                "profit_potential": s.get("profit_potential", {}),
+                "composite_score": s.get("composite_score", 0),
+                "signal_tags": s.get("signal_tags", []),
                 "sim_return_pct": sim_return,
             })
         except Exception as e:
             results.append({"symbol": sym, "name": name, "recommend_price": rec_price, "error": str(e)})
 
-    # 3. 统计
     valid = [r for r in results if "sim_return_pct" in r]
-    if valid:
-        avg_return = round(sum(r["sim_return_pct"] for r in valid) / len(valid), 2)
-    else:
-        avg_return = 0
-
+    avg_return = round(sum(r["sim_return_pct"] for r in valid) / len(valid), 2) if valid else 0
     passed = avg_return >= 15.0
 
     print(f"  推荐日期: {recommend_date}")
@@ -921,7 +863,8 @@ def validate_screening(days: int = 60, top_n: int = 5, scope: str = "hs300") -> 
     print(f"  达标 (≥15%): {'✅ 通过' if passed else '❌ 未通过'}")
     for r in results:
         ret = r.get('sim_return_pct', '?')
-        print(f"    {r['symbol']} {r['name']}: 推荐价{r.get('recommend_price','?')} → 模拟收益{ret}%")
+        tags = ", ".join(r.get("signal_tags", [])[:3])
+        print(f"    {r['symbol']} {r['name']}: 推荐价{r.get('recommend_price','?')} → 模拟收益{ret}% [{tags}]")
 
     return {
         "passed": passed,
@@ -936,38 +879,46 @@ def validate_screening(days: int = 60, top_n: int = 5, scope: str = "hs300") -> 
 # ═══════════════════════════════════════════════════════════════
 
 def _print_table(stocks: list):
-    """打印格式化表格。"""
+    """打印四因子选股结果表格。"""
     if not stocks:
         print("  无符合条件的股票")
         return
-    header = (f"{'代码':<8} {'名称':<10} {'现价':>8} {'涨跌%':>8} {'评分':>5} "
-              f"{'AI':>4} {'入场价':>8} {'止损':>8} {'入场类型':<16} {'PE':>6} {'ROE%':>6}")
-    sep = "-" * len(header)
+    header = (f"{'排名':>4} {'代码':<8} {'名称':<10} {'现价':>8} {'涨跌%':>7} "
+              f"{'综合分':>6} {'主力':>5} {'热点':>5} {'空间':>5} {'质量':>5} "
+              f"{'信号标签':<28} {'入场价':>8} {'止损':>8}")
+    sep = "-" * max(len(header) + 10, 100)
     print(sep)
     print(header)
     print(sep)
-    for s in stocks:
+    for idx, s in enumerate(stocks, 1):
         ep = f"{s['entry_price']:.2f}" if s.get("entry_price") else "-"
         sl = f"{s['stop_loss']:.2f}" if s.get("stop_loss") else "-"
-        et = s.get("entry_type", "-") or "-"
-        ds = s.get("deepseek_signal", "")
-        ds_display = ds[0] if ds else "-"
+        cs = s.get("category_scores", {})
+        tags = s.get("signal_tags", [])
+        tag_str = ", ".join(tags[:4])
+        chg = s.get("change_pct")
+        chg_str = f"{chg:+.2f}" if chg is not None else "-"
         print(
-            f"{s['symbol']:<8} {s['name']:<10} "
+            f"{idx:>4} {s['symbol']:<8} {s['name']:<10} "
             f"{s['close'] or '-':>8} "
-            f"{s['change_pct'] or '-':>8} "
-            f"{s['score']:>5} "
-            f"{ds_display:>4} "
+            f"{chg_str:>7} "
+            f"{s.get('composite_score', 0):>6.1f} "
+            f"{cs.get('主力痕迹', 0):>5.1f} "
+            f"{cs.get('热点引擎', 0):>5.1f} "
+            f"{cs.get('未来空间', 0):>5.1f} "
+            f"{cs.get('基本质量', 0):>5.1f} "
+            f"{tag_str:<28} "
             f"{ep:>8} "
-            f"{sl:>8} "
-            f"{et:<16} "
-            f"{s['pe'] or '-':>6} "
-            f"{s['roe'] or '-':>6}"
+            f"{sl:>8}"
         )
-    if any(s.get("deepseek_signal") for s in stocks):
-        print(sep)
-        print(f"  AI列: DeepSeek V4 Pro 信号 (B=BUY H=HOLD S=SELL)")
     print(sep)
+    if any(s.get("deepseek_rationale") for s in stocks):
+        print("\n  AI点评:")
+        for s in stocks:
+            rationale = s.get("deepseek_rationale", "")
+            if rationale:
+                print(f"    {s['symbol']} {s['name']}: {rationale}")
+    print()
 
 
 if __name__ == "__main__":
@@ -975,12 +926,13 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    parser = argparse.ArgumentParser(description="智能选股 — A股技术+基本面筛选")
+    parser = argparse.ArgumentParser(description="四因子攻击性选股 — 主力痕迹+热点引擎+未来空间+基本质量")
     parser.add_argument("--scope", default="hs300", choices=["hs300", "zz500"],
                         help="扫描范围 (default: hs300)")
-    parser.add_argument("--top", type=int, default=20, help="返回数量 (default: 20)")
+    parser.add_argument("--top", type=int, default=5, help="返回数量 (default: 5)")
     parser.add_argument("--sector", help="行业过滤关键词")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
+    parser.add_argument("--llm", action="store_true", help="启用 DeepSeek AI 点评（默认关闭）")
     parser.add_argument("--validate", type=int, default=0, help="验证选股: 跟踪天数(如60)")
     args = parser.parse_args()
 
@@ -990,11 +942,15 @@ if __name__ == "__main__":
         sys.exit(0 if result['passed'] else 1)
 
     start = time.time()
-    stocks = screen_stocks(scope=args.scope, top_n=args.top, sector=args.sector)
+    stocks = screen_stocks(scope=args.scope, top_n=args.top, sector=args.sector,
+                           use_mock=not args.llm)
     elapsed = time.time() - start
 
     if args.json:
         import json
+        # 移除不可序列化的字段
+        for s in stocks:
+            s.pop("factor_result", None)
         print(json.dumps(stocks, ensure_ascii=False, indent=2))
     else:
         _print_table(stocks)

@@ -100,8 +100,9 @@ def run_backtest_with_critic(symbol: str = "600744", time_frame: str = "mid",
 
         # 强制重载模块（可能被上一轮修改过）
         import importlib
-        for mod_name in ['backtest_engine', 'critic_agent', 'auto_improver',
-                          'time_frame_runner', 'decision_engine', 'agent_prompts']:
+        for mod_name in ['backtest.engine', 'agents.critic', 'agents.decision',
+                          'agents.prompts', 'analysis.alpha', 'analysis.holding',
+                          'analysis.factor_weights', 'evolution.improver']:
             if mod_name in sys.modules:
                 try:
                     importlib.reload(sys.modules[mod_name])
@@ -191,25 +192,43 @@ def run_backtest_with_critic(symbol: str = "600744", time_frame: str = "mid",
             break
 
         # ═══ 步骤4: 应用修改 ═══
-        must_fix = must_fix_all
-        if not must_fix:
-            log("无修改指令，进化结束")
-            print("\n  无修改指令，进化结束")
-            break
+        print(f"\n  [3/3] 应用修改指令...")
 
-        print(f"\n  [3/3] 应用修改指令 ({len(must_fix[:3])}条)...")
-        log(f"应用修改指令: {must_fix[:3]}")
+        # 安全网：确保 operations 存在且 target 正确
+        import re as _re
+        if not critic_result.get("operations") and critic_result.get("code_changes"):
+            ops = []
+            for cc in critic_result["code_changes"]:
+                if not isinstance(cc, dict) or not cc.get("file") or not cc.get("new_code"):
+                    continue
+                file_path = cc["file"]
+                old_code = cc.get("old_code", "")
+                new_code = cc["new_code"]
+                if file_path.endswith(".json"):
+                    tf = "short"
+                    for t in ["short", "mid", "long"]:
+                        if t in cc.get("reason", ""):
+                            tf = t
+                            break
+                    m = _re.search(r'"(\w+)":\s*[\d.]+', old_code)
+                    target = f"{tf}.{m.group(1)}" if m else old_code
+                    m2 = _re.search(r'[\d.]+', new_code)
+                    new_value = float(m2.group()) if m2 else new_code
+                else:
+                    m = _re.search(r'(\b[A-Z_][A-Z0-9_]*)\s*=', old_code)
+                    target = m.group(1) if m else cc.get("function", old_code)
+                    m2 = _re.search(r'[\d.]+', new_code)
+                    new_value = float(m2.group()) if m2 else new_code
+                ops.append({"file": file_path, "target": target, "new_value": new_value})
+            if ops:
+                critic_result["operations"] = ops
+                log(f"  [安全网] 从 code_changes 转换 {len(ops)} 条 operations")
 
-        for i, fix in enumerate(must_fix[:3]):
-            print(f"    🔧 [{i+1}] {fix[:80]}...")
-            success = apply_fix(fix, project_dir)
-            if success:
-                round_info["fixes_applied"].append(fix)
-                log(f"  ✅ 已应用: {fix[:60]}")
-            else:
-                log(f"  ⚠ 未能应用: {fix[:60]}")
+        num_applied = apply_fix(critic_result)
+        round_info["fixes_applied"] = [f"applied_{i}" for i in range(num_applied)]
+        log(f"  本轮应用修改数: {num_applied}")
 
-        if not round_info["fixes_applied"]:
+        if num_applied == 0:
             log("本轮无有效修改，进化结束")
             print("\n  ⚠ 本轮无有效修改，进化结束")
             break

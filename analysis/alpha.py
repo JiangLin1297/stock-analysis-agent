@@ -358,6 +358,262 @@ def margin_change(technical: dict) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 1b. 攻击性因子 — 主力痕迹 / 热点引擎 / 未来空间 / 质量底线
+# ═══════════════════════════════════════════════════════════════
+
+def obv_divergence(df: pd.DataFrame) -> float:
+    """
+    OBV 底部背离: 比较近3日股价涨跌与OBV涨跌方向。
+    价格下跌但OBV上升 → 底部吸筹信号，返回 +5。
+    价格持平但OBV上升 → 次级信号，返回 +3。
+    返回 0~10。
+    """
+    if df is None or len(df) < 20:
+        return 0.0
+    close = df["close"].values
+    volume = df["volume"].values.astype(float) if "volume" in df.columns else None
+    if volume is None or len(volume) < 20:
+        return 0.0
+
+    # 计算OBV
+    obv = np.zeros(len(close))
+    for i in range(1, len(close)):
+        if close[i] > close[i - 1]:
+            obv[i] = obv[i - 1] + volume[i]
+        elif close[i] < close[i - 1]:
+            obv[i] = obv[i - 1] - volume[i]
+        else:
+            obv[i] = obv[i - 1]
+
+    # 近3日: 股价方向 vs OBV方向
+    price_dir = close[-1] - close[-4]
+    obv_dir = obv[-1] - obv[-4]
+
+    # 20日窗口比较
+    recent_close = close[-20:]
+    prev_close = close[-40:-20] if len(close) >= 40 else close[:20]
+    recent_obv = obv[-20:]
+    prev_obv = obv[-40:-20] if len(obv) >= 40 else obv[:20]
+
+    score = 0.0
+    # 近3日背离
+    if price_dir < 0 and obv_dir > 0:
+        score = max(score, 5.0)
+    # 20日价格新低但OBV未新低
+    if len(prev_close) > 0:
+        if min(recent_close) < min(prev_close) * 0.98 and min(recent_obv) > min(prev_obv):
+            score = max(score, 5.0)
+        elif abs(np.mean(recent_close) / np.mean(prev_close) - 1) < 0.03 and \
+             np.mean(recent_obv) > np.mean(prev_obv) * 1.1:
+            score = max(score, 3.0)
+
+    return score
+
+
+def volume_price_divergence(df: pd.DataFrame) -> float:
+    """
+    量价背离: 放量滞涨（5日均量>20日均量1.8倍且涨幅<3%）→ 主力吸筹。
+    放量突破（5日均量>20日均量1.5倍且涨幅>5%）→ 趋势启动。
+    返回 0~10。
+    """
+    if df is None or len(df) < 20:
+        return 0.0
+    if "volume" not in df.columns:
+        return 0.0
+
+    close = df["close"]
+    volume = df["volume"]
+    vol_5 = float(volume.tail(5).mean())
+    vol_20 = float(volume.tail(20).mean())
+    if vol_20 <= 0:
+        return 0.0
+
+    vol_ratio = vol_5 / vol_20
+    price_change_5d = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1) * 100 if len(close) >= 6 else 0
+
+    if vol_ratio >= 1.8 and abs(price_change_5d) < 3:
+        return 4.0  # 放量滞涨 → 吸筹
+    if vol_ratio >= 1.5 and price_change_5d >= 5:
+        return 4.0  # 放量突破
+    if vol_ratio >= 1.3 and price_change_5d < 0:
+        return 2.0  # 温和放量下跌
+    return 0.0
+
+
+def sector_momentum_rank(quote: dict) -> float:
+    """
+    板块动量排名（代理指标）: 基于股票名称关键词匹配热门板块。
+    匹配到高热度板块返回 +5，中热度返回 +3。
+    返回 0~10。
+    """
+    name = str(quote.get("name", "")) if quote else ""
+    if not name:
+        return 0.0
+
+    hot_keywords = {
+        "AI": 5, "人工智能": 5, "大模型": 5, "算力": 5,
+        "机器人": 5, "智能驾驶": 5, "自动驾驶": 5,
+        "半导体": 5, "芯片": 5, "光刻": 4,
+        "低空经济": 5, "量子": 4, "脑机": 4,
+        "固态电池": 4, "卫星": 4,
+        "军工": 4, "航空航天": 4,
+        "新能源": 3, "锂电": 3, "储能": 3, "光伏": 3,
+        "数据要素": 4, "数字经济": 3,
+        "生物医药": 3, "创新药": 3, "CRO": 3,
+    }
+
+    for kw, score in hot_keywords.items():
+        if kw in name:
+            return float(score)
+    return 0.0
+
+
+def limit_up_gene(df: pd.DataFrame) -> float:
+    """
+    涨停基因: 近1月有过涨停(+3)，有过连板(+5)。
+    返回 0~10。
+    """
+    if df is None or len(df) < 20:
+        return 0.0
+    close = df["close"]
+    pct = close.pct_change() * 100
+    recent_30 = pct.tail(30)
+
+    limit_up_count = int((recent_30 >= 9.5).sum())
+
+    if limit_up_count >= 3:
+        return 10.0
+    elif limit_up_count >= 2:
+        return 7.0
+    elif limit_up_count >= 1:
+        return 5.0
+    return 0.0
+
+
+def drawdown_recovery_potential(df: pd.DataFrame) -> float:
+    """
+    超跌恢复潜力: 距历史最高价跌幅>30% → 超跌反弹空间大。
+    返回 0~10。
+    """
+    if df is None or len(df) < 20:
+        return 0.0
+    close = df["close"]
+    current = float(close.iloc[-1])
+    high_all = float(close.max())
+    if high_all <= 0:
+        return 0.0
+
+    drawdown = (high_all - current) / high_all
+
+    if drawdown >= 0.5:
+        return 4.0  # 跌幅过大，可能是趋势下行，给中等分
+    elif drawdown >= 0.3:
+        return 4.0
+    elif drawdown >= 0.2:
+        return 2.0
+    return 0.0
+
+
+def float_market_cap_score(quote: dict) -> float:
+    """
+    流通市值评分: 50~300亿最优（流动性好+成长空间大）。
+    返回 0~10。
+    """
+    if not quote:
+        return 0.0
+    mc = quote.get("market_cap")
+    if mc is None:
+        return 0.0
+    try:
+        mc = float(mc)
+    except (ValueError, TypeError):
+        return 0.0
+
+    mc_yi = mc / 1e8  # 转亿
+    if 50 <= mc_yi <= 300:
+        return 4.0
+    elif 30 <= mc_yi < 50 or 300 < mc_yi <= 500:
+        return 3.0
+    elif 1000 < mc_yi:
+        return 1.0
+    return 0.0
+
+
+def bollinger_expansion(df: pd.DataFrame) -> float:
+    """
+    布林带扩张: 布林带宽度较20日前扩大>20% → 波动率扩张，变盘在即。
+    返回 0~10。
+    """
+    if df is None or len(df) < 40:
+        return 0.0
+    close = df["close"]
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    bb_width = (bb_std * 4 / bb_mid).dropna()
+
+    if len(bb_width) < 20:
+        return 0.0
+
+    current_width = float(bb_width.iloc[-1])
+    past_width = float(bb_width.iloc[-20])
+    if past_width <= 0:
+        return 0.0
+
+    expansion_ratio = current_width / past_width
+    if expansion_ratio >= 1.5:
+        return 3.0
+    elif expansion_ratio >= 1.2:
+        return 3.0
+    elif expansion_ratio >= 1.0:
+        return 1.0
+    return 0.0
+
+
+def quality_baseline_filter(df: pd.DataFrame, financials: dict,
+                            quote: dict = None) -> float:
+    """
+    质量底线过滤: ST/*ST/负债率>90%直接返回0分并标记剔除。
+    非ST且负债率<90%时按ROE和营收增长评分。
+    返回 0~10。
+    """
+    # ST 检查
+    name = str(quote.get("name", "")) if quote else ""
+    if "ST" in name or "*ST" in name:
+        return 0.0
+
+    if not financials:
+        return 3.0  # 无财务数据给中性分
+
+    debt = _safe_float(financials.get("debt_ratio"))
+    if debt is not None and debt > 90:
+        return 0.0
+
+    score = 3.0  # 基础分
+    roe = _safe_float(financials.get("roe"))
+    if roe is not None:
+        if roe >= 20:
+            score += 4.0
+        elif roe >= 15:
+            score += 3.0
+        elif roe >= 10:
+            score += 2.0
+        elif roe >= 5:
+            score += 1.0
+
+    rev_growth = _safe_float(financials.get("revenue_growth") or
+                              financials.get("net_profit_growth"))
+    if rev_growth is not None:
+        if rev_growth >= 30:
+            score += 3.0
+        elif rev_growth >= 20:
+            score += 2.0
+        elif rev_growth >= 10:
+            score += 1.0
+
+    return min(score, 10.0)
+
+
+# ═══════════════════════════════════════════════════════════════
 # 3. 因子合成
 # ═══════════════════════════════════════════════════════════════
 
@@ -380,6 +636,15 @@ FACTOR_REGISTRY = {
     "market_cap_factor":  (market_cap_factor,  ["quote"],         "市值因子"),
     "north_flow_days":    (north_flow_days,    ["df"],            "北向资金流入天数"),
     "margin_change":      (margin_change,      ["technical"],     "融资余额变化"),
+    # ── 攻击性因子 ──
+    "obv_divergence":          (obv_divergence,          ["df"],                    "OBV底部背离"),
+    "volume_price_divergence": (volume_price_divergence, ["df"],                    "量价背离"),
+    "sector_momentum_rank":    (sector_momentum_rank,    ["quote"],                 "板块动量排名"),
+    "limit_up_gene":           (limit_up_gene,           ["df"],                    "涨停基因"),
+    "drawdown_recovery_potential": (drawdown_recovery_potential, ["df"],            "超跌恢复潜力"),
+    "float_market_cap_score":  (float_market_cap_score,  ["quote"],                 "流通市值评分"),
+    "bollinger_expansion":     (bollinger_expansion,     ["df"],                    "布林带扩张"),
+    "quality_baseline_filter": (quality_baseline_filter, ["df", "financials", "quote"], "质量底线过滤"),
 }
 
 
@@ -470,13 +735,15 @@ def calc_all_factors(symbol: str, market: str = "A",
     return factors
 
 
-def composite_score(factors: dict, time_frame: str = "mid") -> dict:
+def composite_score(factors: dict, time_frame: str = "mid",
+                    weight_profile: str = "default") -> dict:
     """
     根据时间框架的因子权重计算综合评分。
 
     Args:
         factors: calc_all_factors 返回的因子字典
         time_frame: "short" / "mid" / "long"
+        weight_profile: "default"=原始因子权重 / "aggressive"=攻击性四因子权重
 
     Returns:
         {
@@ -487,6 +754,9 @@ def composite_score(factors: dict, time_frame: str = "mid") -> dict:
             "time_frame": 时间框架,
         }
     """
+    if weight_profile == "aggressive":
+        return _composite_score_aggressive(factors, time_frame)
+
     weights_cfg = _load_weights()
     tf_weights = weights_cfg.get(time_frame, DEFAULT_WEIGHTS.get(time_frame, {}))
     threshold = tf_weights.get("threshold", 55)
@@ -539,6 +809,203 @@ def composite_score(factors: dict, time_frame: str = "mid") -> dict:
         "threshold": threshold,
         "time_frame": time_frame,
     }
+
+
+# ── 攻击性四因子权重体系 ──
+AGGRESSIVE_CATEGORY_WEIGHTS = {
+    "主力痕迹": 0.30,
+    "热点引擎": 0.25,
+    "未来空间": 0.20,
+    "基本质量": 0.25,
+}
+
+AGGRESSIVE_FACTOR_CATEGORIES = {
+    "obv_divergence":          ("主力痕迹", 0.25),
+    "volume_price_divergence": ("主力痕迹", 0.25),
+    "volume_ratio":            ("主力痕迹", 0.20),
+    "avg_turnover_20d":        ("主力痕迹", 0.15),
+    "margin_change":           ("主力痕迹", 0.15),
+    "sector_momentum_rank":    ("热点引擎", 0.35),
+    "limit_up_gene":           ("热点引擎", 0.30),
+    "north_flow_days":         ("热点引擎", 0.20),
+    "excess_return_vs_index":  ("热点引擎", 0.15),
+    "drawdown_recovery_potential": ("未来空间", 0.30),
+    "float_market_cap_score":  ("未来空间", 0.25),
+    "avg_turnover_20d_dup":   ("未来空间", 0.25),  # 共享因子，见下方处理
+    "bollinger_expansion":     ("未来空间", 0.20),
+    "quality_baseline_filter": ("基本质量", 0.35),
+    "roe_ttm":                 ("基本质量", 0.30),
+    "roe_stability":           ("基本质量", 0.20),
+    "gross_margin_trend":      ("基本质量", 0.15),
+}
+
+# 因子→类别映射（每个因子只归属一个主类别，用于贡献归类）
+_FACTOR_TO_CATEGORY = {
+    "obv_divergence":          "主力痕迹",
+    "volume_price_divergence": "主力痕迹",
+    "volume_ratio":            "主力痕迹",
+    "avg_turnover_20d":        "主力痕迹",
+    "margin_change":           "主力痕迹",
+    "sector_momentum_rank":    "热点引擎",
+    "limit_up_gene":           "热点引擎",
+    "north_flow_days":         "热点引擎",
+    "excess_return_vs_index":  "热点引擎",
+    "drawdown_recovery_potential": "未来空间",
+    "float_market_cap_score":  "未来空间",
+    "bollinger_expansion":     "未来空间",
+    "quality_baseline_filter": "基本质量",
+    "roe_ttm":                 "基本质量",
+    "roe_stability":           "基本质量",
+    "gross_margin_trend":      "基本质量",
+}
+
+# 每个类别内的子因子权重（归一化）
+_CATEGORY_SUB_WEIGHTS = {
+    "主力痕迹": {
+        "obv_divergence": 0.25,
+        "volume_price_divergence": 0.25,
+        "volume_ratio": 0.20,
+        "avg_turnover_20d": 0.15,
+        "margin_change": 0.15,
+    },
+    "热点引擎": {
+        "sector_momentum_rank": 0.35,
+        "limit_up_gene": 0.30,
+        "north_flow_days": 0.20,
+        "excess_return_vs_index": 0.15,
+    },
+    "未来空间": {
+        "drawdown_recovery_potential": 0.30,
+        "float_market_cap_score": 0.25,
+        "bollinger_expansion": 0.25,
+        "momentum_20d": 0.20,  # 复用已有因子
+    },
+    "基本质量": {
+        "quality_baseline_filter": 0.35,
+        "roe_ttm": 0.30,
+        "roe_stability": 0.20,
+        "gross_margin_trend": 0.15,
+    },
+}
+
+
+def _composite_score_aggressive(factors: dict, time_frame: str) -> dict:
+    """
+    攻击性四因子综合评分:
+    主力痕迹(30%) + 热点引擎(25%) + 未来空间(20%) + 基本质量(25%)
+
+    子因子评分 0~10，加权后映射到 0~100。
+    """
+    # 从 factor_weights.json 读取阈值（Critic 可修改）
+    weights_cfg = _load_weights()
+    tf_weights = weights_cfg.get(time_frame, {})
+    threshold = tf_weights.get("threshold", {"short": 45, "mid": 50, "long": 55}.get(time_frame, 50))
+
+    contributions = {}
+    category_scores = {}
+
+    for cat_name, cat_weight in AGGRESSIVE_CATEGORY_WEIGHTS.items():
+        sub_weights = _CATEGORY_SUB_WEIGHTS.get(cat_name, {})
+        cat_score = 0.0
+        used_w = 0.0
+
+        for fname, sub_w in sub_weights.items():
+            raw = factors.get(fname)
+            if raw is None:
+                contributions[fname] = 0
+                continue
+            # 因子原始值已经是 0~10 区间（攻击性因子）或需要映射（传统因子）
+            if fname in _FACTOR_TO_CATEGORY:
+                # 攻击性因子：直接使用 0~10
+                factor_score = min(10.0, max(0.0, float(raw)))
+            else:
+                # 传统因子：映射到 0~10
+                factor_score = _map_traditional_factor(fname, raw)
+
+            weighted = factor_score * sub_w
+            cat_score += weighted
+            used_w += sub_w
+            contributions[fname] = round(weighted * cat_weight, 2)
+
+        if used_w > 0:
+            cat_score = cat_score / used_w  # 归一化到 0~10
+        category_scores[cat_name] = round(cat_score, 2)
+
+    # 综合评分: 类别分数(0~10) × 类别权重 → 映射到 0~100
+    total_score = sum(
+        category_scores[cat] * AGGRESSIVE_CATEGORY_WEIGHTS[cat]
+        for cat in AGGRESSIVE_CATEGORY_WEIGHTS
+    ) * 10  # 0~10 * 权重 * 10 = 0~100
+    total_score = round(max(0.0, min(100.0, total_score)), 1)
+
+    # 信号判定
+    if total_score >= threshold + 15:
+        signal = "BUY"
+    elif total_score >= threshold:
+        signal = "CAUTIOUS_BUY"
+    elif total_score <= threshold - 20:
+        signal = "SELL"
+    elif total_score <= threshold - 10:
+        signal = "CAUTIOUS_SELL"
+    else:
+        signal = "HOLD"
+
+    # 数据不足保护: 超半数因子缺失时，不下 SELL 判定（给 MA+RSI 机会）
+    total_factors = sum(len(_CATEGORY_SUB_WEIGHTS.get(c, {})) for c in AGGRESSIVE_CATEGORY_WEIGHTS)
+    available_factors = sum(1 for fname in contributions if contributions[fname] != 0 and not fname.startswith("_"))
+    if total_factors > 0 and available_factors < total_factors * 0.5:
+        if signal in ("SELL", "CAUTIOUS_SELL"):
+            signal = "HOLD"
+            contributions["_data_sparse"] = -1
+
+    # 质量底线硬约束: 基本质量=0分时强制不买
+    if category_scores.get("基本质量", 0) <= 0:
+        if signal in ("BUY", "CAUTIOUS_BUY"):
+            signal = "HOLD"
+            contributions["_quality_veto"] = -999
+
+    return {
+        "score": total_score,
+        "signal": signal,
+        "contributions": contributions,
+        "threshold": threshold,
+        "time_frame": time_frame,
+        "category_scores": category_scores,
+        "weight_profile": "aggressive",
+    }
+
+
+def _map_traditional_factor(fname: str, raw: float) -> float:
+    """将传统因子的原始值映射到 0~10 区间。"""
+    if raw is None:
+        return 0.0
+    raw = float(raw)
+    if fname == "momentum_20d":
+        return max(0, min(10, 5 + raw / 2))  # -10%~+10% → 0~10
+    elif fname == "momentum_60d":
+        return max(0, min(10, 5 + raw / 4))
+    elif fname == "momentum_120d":
+        return max(0, min(10, 5 + raw / 8))
+    elif fname == "roe_ttm":
+        return max(0, min(10, raw / 2))  # 0%~20% → 0~10
+    elif fname == "roe_stability":
+        return max(0, min(10, raw * 10))  # 0~1 → 0~10
+    elif fname == "gross_margin_trend":
+        return max(0, min(10, 5 + raw / 4))
+    elif fname == "volatility_20d":
+        return max(0, min(10, 10 - raw / 10))  # 低波动高分
+    elif fname == "pe_percentile":
+        return max(0, min(10, 10 - raw * 10))  # 低PE高分
+    elif fname == "pb_percentile":
+        return max(0, min(10, 10 - raw * 10))
+    elif fname == "ma_bull_alignment":
+        return max(0, min(10, raw / 6))  # 0~60天 → 0~10
+    elif fname == "breakout_20d_high":
+        return 10.0 if raw else 0.0
+    elif fname == "market_cap_factor":
+        return max(0, min(10, raw * 10))
+    else:
+        return max(0, min(10, 5 + float(raw)))
 
 
 def rank_stocks(universe: list = None, top_n: int = 50,
@@ -615,7 +1082,7 @@ def _print_factors(symbol: str):
     print(f"  Alpha 因子报告: {symbol}")
     print(f"{'='*60}")
 
-    # 分组显示
+    # 分组显示 — 传统因子
     momentum_group = ["momentum_20d", "momentum_60d", "momentum_120d"]
     quality_group = ["roe_ttm", "roe_stability", "gross_margin_trend"]
     value_group = ["pe_percentile", "pb_percentile", "market_cap_factor"]
@@ -641,15 +1108,47 @@ def _print_factors(symbol: str):
             else:
                 print(f"    {k:<24s} = {'N/A':>10}  ({desc})")
 
-    # 综合评分
+    # 分组显示 — 攻击性因子
+    aggressive_groups = [
+        ("主力痕迹因子", ["obv_divergence", "volume_price_divergence", "volume_ratio", "avg_turnover_20d"]),
+        ("热点引擎因子", ["sector_momentum_rank", "limit_up_gene", "north_flow_days", "excess_return_vs_index"]),
+        ("未来空间因子", ["drawdown_recovery_potential", "float_market_cap_score", "bollinger_expansion", "momentum_20d"]),
+        ("质量底线因子", ["quality_baseline_filter", "roe_ttm", "roe_stability", "gross_margin_trend"]),
+    ]
+
+    for gname, gkeys in aggressive_groups:
+        print(f"\n  [{gname}]")
+        for k in gkeys:
+            v = factors.get(k)
+            desc = FACTOR_REGISTRY.get(k, (None, None, "?"))[2]
+            if v is not None:
+                print(f"    {k:<24s} = {v:>10.4f}  ({desc})")
+            else:
+                print(f"    {k:<24s} = {'N/A':>10}  ({desc})")
+
+    # 综合评分 — 传统权重
+    sig_map = {"BUY": "买入", "CAUTIOUS_BUY": "谨慎买入", "HOLD": "持有",
+               "CAUTIOUS_SELL": "谨慎卖出", "SELL": "卖出"}
+    print(f"\n  ── 传统因子权重 ──")
     for tf in ["short", "mid", "long"]:
-        comp = composite_score(factors, tf)
-        sig_map = {"BUY": "买入", "CAUTIOUS_BUY": "谨慎买入", "HOLD": "持有",
-                   "CAUTIOUS_SELL": "谨慎卖出", "SELL": "卖出"}
-        print(f"\n  [{tf}线] 综合评分: {comp['score']:.1f}/100 "
+        comp = composite_score(factors, tf, weight_profile="default")
+        print(f"  [{tf}线] 综合评分: {comp['score']:.1f}/100 "
               f"→ {sig_map.get(comp['signal'], comp['signal'])} (阈值={comp['threshold']})")
         top_contrib = sorted(comp["contributions"].items(), key=lambda x: abs(x[1]), reverse=True)[:5]
         contrib_str = " | ".join(f"{k}={v:+.1f}" for k, v in top_contrib if v != 0)
+        print(f"    贡献: {contrib_str}")
+
+    # 综合评分 — 攻击性权重
+    print(f"\n  ── 攻击性四因子权重 (主力30%/热点25%/空间20%/质量25%) ──")
+    for tf in ["short", "mid", "long"]:
+        comp = composite_score(factors, tf, weight_profile="aggressive")
+        cats = comp.get("category_scores", {})
+        cat_str = " | ".join(f"{k}={v:.1f}" for k, v in cats.items())
+        print(f"  [{tf}线] 综合评分: {comp['score']:.1f}/100 "
+              f"→ {sig_map.get(comp['signal'], comp['signal'])} (阈值={comp['threshold']})")
+        print(f"    分类: {cat_str}")
+        top_contrib = sorted(comp["contributions"].items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+        contrib_str = " | ".join(f"{k}={v:+.1f}" for k, v in top_contrib if v != 0 and not k.startswith("_"))
         print(f"    贡献: {contrib_str}")
 
     if meta.get("errors"):

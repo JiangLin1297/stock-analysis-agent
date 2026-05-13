@@ -33,10 +33,10 @@ _DEFAULT_BASE_URL = "https://api.deepseek.com"
 _DEFAULT_MODEL = "deepseek-v4-pro"
 _DEFAULT_TEMPERATURE = 0.7
 _DEFAULT_MAX_TOKENS = 8192
-_DEFAULT_TIMEOUT = 30
-_DEFAULT_CONNECT_TIMEOUT = 8
-_MAX_RETRIES = 2
-_RETRY_BACKOFF_BASE = 2  # 指数退避基数（2, 4, 8, 16...）
+_DEFAULT_TIMEOUT = 60
+_DEFAULT_CONNECT_TIMEOUT = 10
+_MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE = 4  # 指数退避基数（4, 16, 64...）
 
 
 def _load_config_from_file():

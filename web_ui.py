@@ -59,6 +59,9 @@ DEFAULTS = {
     "_analysis_use_mock": True,
     "_analysis_use_portfolio": False,
     "_analysis_last_poll": 0.0,
+    # Batch deep analysis state
+    "_batch_results": None,
+    "_batch_running": False,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -674,18 +677,92 @@ elif current_page == "智能选股":
         import pandas as pd
         rows = []
         for i, stock in enumerate(results):
-            quote = stock.get("quote", {})
-            technical = stock.get("technical", {})
+            chg = stock.get("change_pct")
             rows.append({
                 "排名": i + 1,
                 "代码": stock.get("symbol", "?"),
                 "名称": stock.get("name", ""),
-                "评分": stock.get("score", 0),
-                "现价": quote.get("price") or technical.get("close", "N/A"),
-                "涨跌%": quote.get("change_pct", 0),
-                "PE": quote.get("pe", "N/A"),
+                "综合评分": stock.get("composite_score", stock.get("score", 0)),
+                "现价": stock.get("close", "N/A"),
+                "涨跌%": f"{chg:+.2f}" if chg is not None else "-",
+                "PE": stock.get("pe", "N/A"),
+                "信号": ", ".join(stock.get("signal_tags", [])[:3]),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # ── 一键深度分析 Top 5 ──
+        st.divider()
+        top5 = results[:5]
+        if st.button("🚀 一键深度分析 Top 5", type="primary", use_container_width=True):
+            st.session_state["_batch_results"] = []
+            st.session_state["_batch_running"] = True
+            batch_results = []
+
+            for idx, stock in enumerate(top5):
+                sym = stock.get("symbol", "")
+                name = stock.get("name", sym)
+                st.info(f"正在分析 {idx + 1}/{len(top5)}: {sym} {name}")
+
+                try:
+                    from agents.decision import run_full_analysis
+                    result = run_full_analysis(sym, use_mock=use_mock_sc, use_portfolio=False, use_adapted_params=True)
+                    decision = result.get("final_decision", result)
+
+                    row = {"代码": sym, "名称": name, "现价": stock.get("close", "N/A")}
+
+                    for tf_key, tf_label in [("short_term", "短线"), ("mid_term", "中线"), ("long_term", "长线")]:
+                        dim = decision.get(tf_key, {})
+                        act = str(dim.get("action", "HOLD")).upper()
+                        if act in ("BUY", "STRONG_BUY", "CAUTIOUS_BUY"):
+                            icon = "🟢"
+                        elif act in ("SELL", "STRONG_SELL", "CAUTIOUS_SELL"):
+                            icon = "🔴"
+                        else:
+                            icon = "⚪"
+                        conf = dim.get("confidence", 0)
+                        conf_pct = int(float(conf) * 100) if conf else 0
+                        row[f"{tf_label}信号"] = f"{icon} {act}"
+                        row[f"{tf_label}置信度"] = f"{conf_pct}%"
+                        row[f"{tf_label}止损"] = dim.get("stop_loss_price", "N/A")
+                        row[f"{tf_label}止盈"] = dim.get("take_profit_price", "N/A")
+                        if tf_key == "mid_term":
+                            row["理由"] = _sanitize(dim.get("rationale", ""), 80)
+
+                    row["error"] = None
+                    batch_results.append(row)
+
+                except Exception as e:
+                    batch_results.append({
+                        "代码": sym, "名称": name, "现价": stock.get("close", "N/A"),
+                        "短线信号": "❌", "中线信号": "❌", "长线信号": "❌",
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+
+            st.session_state["_batch_results"] = batch_results
+            st.session_state["_batch_running"] = False
+            st.rerun()
+
+        # 显示批量分析结果
+        if st.session_state.get("_batch_results"):
+            batch_data = st.session_state["_batch_results"]
+            st.success(f"深度分析完成: {len(batch_data)} 只")
+
+            display_cols = ["代码", "名称", "现价",
+                           "短线信号", "短线置信度", "短线止损", "短线止盈",
+                           "中线信号", "中线置信度", "中线止损", "中线止盈",
+                           "长线信号", "长线置信度", "长线止损", "长线止盈",
+                           "理由"]
+            existing = [c for c in display_cols if any(c in r for r in batch_data)]
+            display_df = pd.DataFrame(batch_data)[existing]
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            for r in batch_data:
+                if r.get("error"):
+                    st.error(f"{r['代码']} {r['名称']}: 分析失败 — {r['error']}")
+
+            if st.button("清除分析结果", key="clear_batch"):
+                st.session_state["_batch_results"] = None
+                st.rerun()
 
         st.divider()
         st.caption("点击跳转到深度分析")
@@ -693,9 +770,12 @@ elif current_page == "智能选股":
         for i, stock in enumerate(results[:12]):
             sym = stock.get("symbol", "?")
             name = stock.get("name", sym)
-            score = stock.get("score", 0)
+            score = stock.get("composite_score", stock.get("score", 0))
+            tags = stock.get("signal_tags", [])
+            tag_str = ", ".join(tags[:2])
             with cols[i % 6]:
-                if st.button(f"{sym} {name} ⭐{score}", key=f"goto_{sym}", use_container_width=True):
+                label = f"{sym} {name}\n{score:.0f}分 {tag_str}" if tag_str else f"{sym} {name}\n{score:.0f}分"
+                if st.button(label, key=f"goto_{sym}", use_container_width=True):
                     st.session_state.deep_symbol = sym
                     st.session_state.page = "深度分析"
                     st.rerun()
@@ -708,9 +788,78 @@ elif current_page == "智能选股":
             "排名": i + 1,
             "代码": s.get("symbol", "?"),
             "名称": s.get("name", ""),
-            "评分": s.get("score", 0),
+            "综合评分": s.get("composite_score", s.get("score", 0)),
+            "信号": ", ".join(s.get("signal_tags", [])[:3]),
         } for i, s in enumerate(st.session_state.screen_results)]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # ── 一键深度分析 Top 5（上次结果） ──
+        top5_cached = st.session_state.screen_results[:5]
+        if st.button("🚀 一键深度分析 Top 5", type="primary", use_container_width=True, key="batch_cached"):
+            st.session_state["_batch_results"] = []
+            st.session_state["_batch_running"] = True
+            batch_results = []
+
+            for idx, stock in enumerate(top5_cached):
+                sym = stock.get("symbol", "")
+                name = stock.get("name", sym)
+                st.info(f"正在分析 {idx + 1}/{len(top5_cached)}: {sym} {name}")
+
+                try:
+                    from agents.decision import run_full_analysis
+                    result = run_full_analysis(sym, use_mock=True, use_portfolio=False, use_adapted_params=True)
+                    decision = result.get("final_decision", result)
+
+                    row = {"代码": sym, "名称": name, "现价": stock.get("close", "N/A")}
+
+                    for tf_key, tf_label in [("short_term", "短线"), ("mid_term", "中线"), ("long_term", "长线")]:
+                        dim = decision.get(tf_key, {})
+                        act = str(dim.get("action", "HOLD")).upper()
+                        if act in ("BUY", "STRONG_BUY", "CAUTIOUS_BUY"):
+                            icon = "🟢"
+                        elif act in ("SELL", "STRONG_SELL", "CAUTIOUS_SELL"):
+                            icon = "🔴"
+                        else:
+                            icon = "⚪"
+                        conf = dim.get("confidence", 0)
+                        conf_pct = int(float(conf) * 100) if conf else 0
+                        row[f"{tf_label}信号"] = f"{icon} {act}"
+                        row[f"{tf_label}置信度"] = f"{conf_pct}%"
+                        row[f"{tf_label}止损"] = dim.get("stop_loss_price", "N/A")
+                        row[f"{tf_label}止盈"] = dim.get("take_profit_price", "N/A")
+                        if tf_key == "mid_term":
+                            row["理由"] = _sanitize(dim.get("rationale", ""), 80)
+
+                    row["error"] = None
+                    batch_results.append(row)
+
+                except Exception as e:
+                    batch_results.append({
+                        "代码": sym, "名称": name, "现价": stock.get("close", "N/A"),
+                        "短线信号": "❌", "中线信号": "❌", "长线信号": "❌",
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+
+            st.session_state["_batch_results"] = batch_results
+            st.session_state["_batch_running"] = False
+            st.rerun()
+
+        if st.session_state.get("_batch_results"):
+            batch_data = st.session_state["_batch_results"]
+            st.success(f"深度分析完成: {len(batch_data)} 只")
+
+            display_cols = ["代码", "名称", "现价",
+                           "短线信号", "短线置信度", "短线止损", "短线止盈",
+                           "中线信号", "中线置信度", "中线止损", "中线止盈",
+                           "长线信号", "长线置信度", "长线止损", "长线止盈",
+                           "理由"]
+            existing = [c for c in display_cols if any(c in r for r in batch_data)]
+            display_df = pd.DataFrame(batch_data)[existing]
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            for r in batch_data:
+                if r.get("error"):
+                    st.error(f"{r['代码']} {r['名称']}: 分析失败 — {r['error']}")
 
 
 # ═══════════════════════════════════════════════════════════════
