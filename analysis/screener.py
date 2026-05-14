@@ -21,6 +21,17 @@ import numpy as np
 import pandas as pd
 import requests
 
+# 数据库集成（可选）
+try:
+    from data.database import (
+        load_index_constituents as _db_load_constituents,
+        save_index_constituents as _db_save_constituents,
+        save_stock_info as _db_save_stock_info,
+    )
+    _HAS_DB = True
+except ImportError:
+    _HAS_DB = False
+
 # ── 轻量级 HTTP 会话 ──────────────────────────────────────
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -101,6 +112,16 @@ def _get_constituents(scope: str) -> list:
     """获取沪深300或中证500成分股代码列表。"""
     import akshare as ak
     index_code, index_name = INDEX_SCOPE.get(scope, INDEX_SCOPE["hs300"])
+
+    # DB优先：从本地数据库加载成分股列表
+    if _HAS_DB:
+        try:
+            cached = _db_load_constituents(index_code)
+            if len(cached) >= 100:
+                print(f"  [{index_name}] 从数据库加载成分股: {len(cached)}")
+                return cached
+        except Exception:
+            pass
     try:
         df = ak.index_stock_cons(symbol=index_code)
         if df is None or df.empty:
@@ -110,6 +131,12 @@ def _get_constituents(scope: str) -> list:
             if col in df.columns:
                 symbols = [str(s).strip().zfill(6) for s in df[col].tolist()]
                 print(f"  [{index_name}] 成分股数量: {len(symbols)}")
+                # 保存到数据库
+                if _HAS_DB:
+                    try:
+                        _db_save_constituents(index_code, symbols)
+                    except Exception:
+                        pass
                 return symbols
         print(f"  ⚠ 未知列名: {df.columns.tolist()[:5]}")
         return []
@@ -142,6 +169,13 @@ def _get_constituents_fallback(scope: str) -> list:
             df = df.head(800).tail(500)
         symbols = [str(s).strip().zfill(6) for s in df[code_col].tolist()]
         print(f"  备用方案成分股数量: {len(symbols)}")
+        # 保存到数据库
+        if _HAS_DB:
+            try:
+                index_code, _ = INDEX_SCOPE.get(scope, INDEX_SCOPE["hs300"])
+                _db_save_constituents(index_code, symbols)
+            except Exception:
+                pass
         return symbols
     except Exception:
         return []

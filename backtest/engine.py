@@ -201,7 +201,7 @@ def run_backtest(symbol: str, start_date, end_date,
 
     # Reload modules to pick up any code changes (Critic injections, etc.)
     import importlib
-    for _mod in ['agents.decision', 'analysis.holding', 'analysis.alpha', 'data.pipeline']:
+    for _mod in ['analysis.alpha', 'agents.decision', 'analysis.holding', 'data.pipeline']:
         if _mod in sys.modules:
             try:
                 importlib.reload(sys.modules[_mod])
@@ -209,6 +209,19 @@ def run_backtest(symbol: str, start_date, end_date,
                 pass
     from agents.decision import generate_3d_factor_signals
     from analysis.holding import evaluate_holding
+
+    # 强制从磁盘读取最新 factor_weights.json（Critic 可能在上一轮修改了阈值）
+    _fw_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'analysis', 'factor_weights.json')
+    try:
+        with open(_fw_path, 'r', encoding='utf-8') as _f:
+            _fresh_weights = json.load(_f)
+        _fw_short = _fresh_weights.get('short', {}).get('threshold', '?')
+        _fw_mid = _fresh_weights.get('mid', {}).get('threshold', '?')
+        _fw_long = _fresh_weights.get('long', {}).get('threshold', '?')
+        print(f"  [配置] factor_weights.json 阈值: 短线={_fw_short} 中线={_fw_mid} 长线={_fw_long}")
+    except Exception as _e:
+        print(f"  [配置] factor_weights.json 读取失败: {_e}")
 
     if not use_factor_model:
         from agents.decision import make_decision
@@ -238,6 +251,7 @@ def run_backtest(symbol: str, start_date, end_date,
     positions = {tf: None for tf in ["short_term", "mid_term", "long_term"]}
     trade_log = []
     equity_curve = []
+    open_signal_ids = {}  # {(symbol, tf_key): signal_record_id} — 跟踪未平仓信号
     total_equity = initial_capital
     max_dd_so_far = 0.0
     peak_equity = initial_capital
@@ -354,6 +368,22 @@ def run_backtest(symbol: str, start_date, end_date,
                         "reason": "; ".join(hold_eval["reasons"][:2]),
                     })
                     positions[tf_key] = None
+
+                    # 更新信号质量跟踪记录
+                    try:
+                        from data.database import update_signal_outcome
+                        sig_key = (symbol, tf_key)
+                        if sig_key in open_signal_ids:
+                            entry_dt = datetime.strptime(pos.get("open_date", str(trade_date)), "%Y-%m-%d")
+                            days = (trade_date - entry_dt.date()).days if hasattr(trade_date, 'date') else 0
+                            update_signal_outcome(
+                                open_signal_ids.pop(sig_key),
+                                exit_price=current_price,
+                                pnl_pct=round(pnl_pct, 2),
+                                days_held=days,
+                            )
+                    except Exception:
+                        pass
 
                 elif hold_eval["action"] == "TRIM":
                     ratio = hold_eval["ratio"] / 100
@@ -492,6 +522,19 @@ def run_backtest(symbol: str, start_date, end_date,
                                 "factor_contributions": contrib_str,
                             })
 
+                            # 记录买入信号到信号质量跟踪表
+                            try:
+                                from data.database import save_signal_outcome
+                                factor_snap = dim.get("_factors", {})
+                                sig_id = save_signal_outcome(
+                                    symbol, str(trade_date), "BUY", tf_key,
+                                    signal_price=current_price,
+                                    factor_snapshot=factor_snap,
+                                )
+                                open_signal_ids[(symbol, tf_key)] = sig_id
+                            except Exception:
+                                pass
+
         # 4. 更新总权益
         position_value = 0
         for tf_key in positions:
@@ -546,6 +589,22 @@ def run_backtest(symbol: str, start_date, end_date,
                 "pnl_pct": round((final_price / pos["entry_price"] - 1) * 100, 2),
                 "reason": "回测结束强制平仓",
             })
+
+            # 更新信号质量跟踪记录
+            try:
+                from data.database import update_signal_outcome
+                sig_key = (symbol, tf_key)
+                if sig_key in open_signal_ids:
+                    pnl_pct_final = (final_price / pos["entry_price"] - 1) * 100
+                    update_signal_outcome(
+                        open_signal_ids.pop(sig_key),
+                        exit_price=final_price,
+                        pnl_pct=round(pnl_pct_final, 2),
+                        days_held=0,
+                    )
+            except Exception:
+                pass
+
             positions[tf_key] = None
 
     total_equity = cash
@@ -561,6 +620,12 @@ def run_backtest(symbol: str, start_date, end_date,
     print(f"  胜率:     {metrics['win_rate_pct']:.1f}%")
     print(f"  三线达成率: 短{metrics['achievement_short']:.0f}% 中{metrics['achievement_mid']:.0f}% 长{metrics['achievement_long']:.0f}%")
 
+    # ── 回测基因提取：从交易日志中学习个股特征 ──
+    try:
+        _extract_backtest_gene(symbol, trade_log, metrics)
+    except Exception as e:
+        print(f"  [Gene] 回测基因提取失败(不影响回测): {e}")
+
     return {
         "symbol": symbol,
         "start_date": str(start_date),
@@ -571,6 +636,76 @@ def run_backtest(symbol: str, start_date, end_date,
         "equity_curve": equity_curve,
         "metrics": metrics,
     }
+
+
+def _extract_backtest_gene(symbol: str, trade_log: list, metrics: dict):
+    """从回测交易日志中提取个股基因特征，更新 stock_genes 表。"""
+    from data.database import update_stock_gene, get_stock_info as _get_info
+
+    name = _get_info(symbol).get("name", symbol)
+
+    buys = [t for t in trade_log if t.get("action") == "BUY"]
+    closes = [t for t in trade_log if t.get("action") in ("CLOSE", "CLOSE_FINAL")]
+
+    if not buys:
+        return
+
+    # 回调深度：买入后最大回撤均值
+    pullback_depths = []
+    for c in closes:
+        pnl = c.get("pnl_pct", 0)
+        if pnl < 0:
+            pullback_depths.append(abs(pnl))
+    avg_pullback = sum(pullback_depths) / len(pullback_depths) if pullback_depths else 0
+
+    # 反弹强度：盈利交易的平均收益
+    wins = [c for c in closes if c.get("pnl_pct", 0) > 0]
+    avg_rally = sum(c["pnl_pct"] for c in wins) / len(wins) / 100 if wins else 0
+
+    # ATR水平：从交易价格波动估算
+    prices = [t["price"] for t in trade_log if t.get("price")]
+    if len(prices) > 1:
+        import numpy as _np
+        returns = _np.diff(prices) / prices[:-1]
+        atr_est = float(_np.std(returns)) * 100
+    else:
+        atr_est = 0
+
+    # 假突破概率：止损触发比例
+    stop_triggers = [c for c in closes if "止损" in c.get("reason", "")]
+    false_breakout = len(stop_triggers) / len(closes) if closes else 0
+
+    # 洗盘量比：无法从回测日志直接提取，使用默认值
+    washout_ratio = 0.5
+
+    # 缺口反应：无法直接提取，使用默认值
+    gap_reaction = 0
+
+    # MA60对齐：用胜率持续性估算
+    consecutive_wins = 0
+    max_consecutive = 0
+    for c in closes:
+        if c.get("pnl_pct", 0) > 0:
+            consecutive_wins += 1
+            max_consecutive = max(max_consecutive, consecutive_wins)
+        else:
+            consecutive_wins = 0
+
+    gene = {
+        "ma60_alignment_days": max_consecutive * 5,  # 粗略映射
+        "false_breakout_prob": round(false_breakout, 2),
+        "washout_volume_ratio": washout_ratio,
+        "pullback_depth": round(avg_pullback, 2),
+        "rally_strength": round(avg_rally, 2),
+        "atr_level": round(atr_est, 2),
+        "gap_reaction": gap_reaction,
+        "sample_count": len(buys),
+    }
+
+    update_stock_gene(symbol, name, gene)
+    print(f"  [Gene] 回测基因已更新: {symbol} | 交易{len(buys)}次 "
+          f"回调={avg_pullback:.1f}% 反弹={avg_rally:.2f} "
+          f"假突破={false_breakout:.0%} ATR≈{atr_est:.1f}%")
 
 
 def calc_metrics(trade_log: list[dict], equity_curve: list[dict],

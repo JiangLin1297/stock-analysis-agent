@@ -509,35 +509,70 @@ def _heuristic_critique_fallback(metrics: dict, closed_trades: list) -> dict:
     win_rate = metrics.get("win_rate_pct", 0)
     total_trades = metrics.get("total_trades", 0)
 
-    # 规则1: 胜率 < 20% → 下调 BUY 阈值 3 分
-    if win_rate < 20:
-        issues.append(f"胜率仅{win_rate:.0f}%过低，信号质量严重不足")
-        must_fix.append("factor_weights.json: short.threshold 降低3分以放宽入场")
+    # 熊市熔断：回撤>8%且胜率<15%时，禁止降阈值，转为收紧仓位
+    _circuit_breaker = max_dd > 8 and win_rate < 15
 
-    # 规则2: 最大回撤 > 20% → 止损收紧 20%
+    # 读取当前阈值（避免重复建议已执行的修改）
+    _fw_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "analysis", "factor_weights.json")
+    _cur_short_th = 55
+    try:
+        with open(_fw_path, 'r', encoding='utf-8') as _f:
+            _fw = json.load(_f)
+        _cur_short_th = _fw.get("short", {}).get("threshold", 55)
+    except Exception:
+        pass
+    _THRESHOLD_FLOOR = 40
+
+    if _circuit_breaker:
+        issues.append(f"熔断触发:回撤{max_dd:.1f}%>8%且胜率{win_rate:.0f}%<15%，禁止降阈值")
+        must_fix.append("agents/decision.py: position_pct上限从80收紧至35，控制风险")
+    else:
+        # 规则1: 胜率 < 20% → 下调 BUY 阈值 3 分
+        if win_rate < 20:
+            issues.append(f"胜率仅{win_rate:.0f}%过低，信号质量严重不足")
+            _new_th = max(_THRESHOLD_FLOOR, _cur_short_th - 3)
+            if _new_th < _cur_short_th:
+                must_fix.append(f"factor_weights.json: short.threshold 从{_cur_short_th}降至{_new_th}以放宽入场")
+            else:
+                must_fix.append(f"factor_weights.json: short.threshold已为{_cur_short_th}(下限{_THRESHOLD_FLOOR})，无法再降")
+
+        # 规则4: 负收益 → 降低阈值
+        if total_return < 0 and not any("阈值" in f or "threshold" in f for f in must_fix):
+            issues.append(f"总收益{total_return:+.1f}%为负")
+            _new_th = max(_THRESHOLD_FLOOR, _cur_short_th - 2)
+            if _new_th < _cur_short_th:
+                must_fix.append(f"factor_weights.json: short.threshold从{_cur_short_th}降至{_new_th}以捕捉更多机会")
+            else:
+                must_fix.append(f"factor_weights.json: short.threshold已为{_cur_short_th}(下限{_THRESHOLD_FLOOR})，无法再降")
+
+        # 规则5: 交易过少
+        if total_trades < 3:
+            issues.append(f"仅{total_trades}笔交易，系统过于保守")
+            _new_th = max(_THRESHOLD_FLOOR, _cur_short_th - 5)
+            if _new_th < _cur_short_th:
+                must_fix.append(f"factor_weights.json: short.threshold从{_cur_short_th}降至{_new_th}以增加交易频率")
+            else:
+                must_fix.append(f"factor_weights.json: short.threshold已为{_cur_short_th}(下限{_THRESHOLD_FLOOR})，无法再降")
+
+    # 规则2: 最大回撤 > 20% → 止损收紧 20%（不受熔断影响）
     if max_dd > 20:
         issues.append(f"最大回撤{max_dd:.1f}%过大，风控失效")
         must_fix.append("agents/decision.py: 止损宽度收紧20%，强化风险控制")
 
-    # 规则3: 交易次数 > 15 且胜率 < 30% → 减少仓位上限 10%
+    # 规则3: 交易次数 > 15 且胜率 < 30% → 减少仓位上限 10%（不受熔断影响）
     if total_trades > 15 and win_rate < 30:
         issues.append(f"{total_trades}笔交易胜率仅{win_rate:.0f}%，频繁交易但质量差")
         must_fix.append("agents/decision.py: 单线最大仓位上限减少10%")
 
-    # 规则4: 负收益 → 降低阈值
-    if total_return < 0 and not any("阈值" in f or "threshold" in f for f in must_fix):
-        issues.append(f"总收益{total_return:+.1f}%为负")
-        must_fix.append("factor_weights.json: 各线threshold降低2分以捕捉更多机会")
-
-    # 规则5: 交易过少
-    if total_trades < 3:
-        issues.append(f"仅{total_trades}笔交易，系统过于保守")
-        must_fix.append("factor_weights.json: short.threshold降低5分以增加交易频率")
-
     # 保底: 确保至少有 1 条指令
     if not must_fix:
         if total_return < 20:
-            must_fix.append("factor_weights.json: short.threshold降低2分以提升进攻性")
+            _new_th = max(_THRESHOLD_FLOOR, _cur_short_th - 2)
+            if _new_th < _cur_short_th:
+                must_fix.append(f"factor_weights.json: short.threshold从{_cur_short_th}降至{_new_th}以提升进攻性")
+            else:
+                must_fix.append("agents/decision.py: 动态止盈触发阈值提高5%以放大盈利")
             issues.append(f"收益率{total_return:+.1f}%未达预期")
         else:
             must_fix.append("agents/decision.py: 动态止盈触发阈值提高5%以放大盈利")
@@ -588,6 +623,9 @@ def _generate_code_changes(metrics: dict, closed_trades: list) -> list:
     win_rate = metrics.get("win_rate_pct", 0)
     total_trades = metrics.get("total_trades", 0)
 
+    # 熊市熔断：回撤>8%且胜率<15%时，禁止降阈值，转为收紧仓位
+    _circuit_breaker = max_dd > 8 and win_rate < 15
+
     # 项目根目录
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -600,58 +638,68 @@ def _generate_code_changes(metrics: dict, closed_trades: list) -> list:
         weights = None
 
     if weights:
-        # 0笔交易：系统过于保守，大幅降低阈值
-        if total_trades == 0:
-            for tf in ["short", "mid"]:
-                threshold = weights.get(tf, {}).get("threshold", 55)
-                new_threshold = max(40, threshold - 5)
-                if new_threshold != threshold:
-                    code_changes.append({
-                        "file": "analysis/factor_weights.json",
-                        "function": "",
-                        "old_code": f'"threshold": {threshold}',
-                        "new_code": f'"threshold": {new_threshold}',
-                        "reason": f"0笔交易，降低{tf}线阈值{threshold}→{new_threshold}放宽入场",
-                    })
+        if _circuit_breaker:
+            # 熊市熔断：回撤>8%且胜率<15%，禁止降阈值，收紧仓位上限
+            code_changes.append({
+                "file": "agents/decision.py",
+                "function": "generate_factor_signal",
+                "old_code": "position_pct = min(base_pos * (1 + score_strength * 2), 80)",
+                "new_code": "position_pct = min(base_pos * (1 + score_strength * 2), 35)",
+                "reason": f"熔断:回撤{max_dd:.1f}%>8%且胜率{win_rate:.0f}%<15%，收紧仓位上限80→35",
+            })
+        else:
+            # 0笔交易：系统过于保守，大幅降低阈值
+            if total_trades == 0:
+                for tf in ["short", "mid"]:
+                    threshold = weights.get(tf, {}).get("threshold", 55)
+                    new_threshold = max(40, threshold - 5)
+                    if new_threshold != threshold:
+                        code_changes.append({
+                            "file": "analysis/factor_weights.json",
+                            "function": "",
+                            "old_code": f'"threshold": {threshold}',
+                            "new_code": f'"threshold": {new_threshold}',
+                            "reason": f"0笔交易，降低{tf}线阈值{threshold}→{new_threshold}放宽入场",
+                        })
 
-        if win_rate < 20 and total_trades >= 3:
-            for tf in ["short", "mid", "long"]:
-                threshold = weights.get(tf, {}).get("threshold", 55)
-                new_threshold = max(40, threshold - 3)
-                if new_threshold != threshold:
-                    code_changes.append({
-                        "file": "analysis/factor_weights.json",
-                        "function": "",
-                        "old_code": f'"threshold": {threshold}',
-                        "new_code": f'"threshold": {new_threshold}',
-                        "reason": f"胜率仅{win_rate:.0f}%，降低{tf}线阈值{threshold}→{new_threshold}",
-                    })
+            if win_rate < 20 and total_trades >= 3:
+                for tf in ["short", "mid", "long"]:
+                    threshold = weights.get(tf, {}).get("threshold", 55)
+                    new_threshold = max(40, threshold - 3)
+                    if new_threshold != threshold:
+                        code_changes.append({
+                            "file": "analysis/factor_weights.json",
+                            "function": "",
+                            "old_code": f'"threshold": {threshold}',
+                            "new_code": f'"threshold": {new_threshold}',
+                            "reason": f"胜率仅{win_rate:.0f}%，降低{tf}线阈值{threshold}→{new_threshold}",
+                        })
 
-        if total_return < 0 and not any(c["file"] == "analysis/factor_weights.json" for c in code_changes):
-            for tf in ["short", "mid", "long"]:
-                threshold = weights.get(tf, {}).get("threshold", 55)
-                new_threshold = max(40, threshold - 2)
-                if new_threshold != threshold:
-                    code_changes.append({
-                        "file": "analysis/factor_weights.json",
-                        "function": "",
-                        "old_code": f'"threshold": {threshold}',
-                        "new_code": f'"threshold": {new_threshold}',
-                        "reason": f"负收益{total_return:+.1f}%，降低{tf}线阈值{threshold}→{new_threshold}",
-                    })
+            if total_return < 0 and not any(c["file"] == "analysis/factor_weights.json" for c in code_changes):
+                for tf in ["short", "mid", "long"]:
+                    threshold = weights.get(tf, {}).get("threshold", 55)
+                    new_threshold = max(40, threshold - 2)
+                    if new_threshold != threshold:
+                        code_changes.append({
+                            "file": "analysis/factor_weights.json",
+                            "function": "",
+                            "old_code": f'"threshold": {threshold}',
+                            "new_code": f'"threshold": {new_threshold}',
+                            "reason": f"负收益{total_return:+.1f}%，降低{tf}线阈值{threshold}→{new_threshold}",
+                        })
 
-        if 0 < total_trades < 3:
-            for tf in ["short", "mid"]:
-                threshold = weights.get(tf, {}).get("threshold", 55)
-                new_threshold = max(40, threshold - 5)
-                if new_threshold != threshold:
-                    code_changes.append({
-                        "file": "analysis/factor_weights.json",
-                        "function": "",
-                        "old_code": f'"threshold": {threshold}',
-                        "new_code": f'"threshold": {new_threshold}',
-                        "reason": f"仅{total_trades}笔交易，降低{tf}线阈值{threshold}→{new_threshold}增加交易频率",
-                    })
+            if 0 < total_trades < 3:
+                for tf in ["short", "mid"]:
+                    threshold = weights.get(tf, {}).get("threshold", 55)
+                    new_threshold = max(40, threshold - 5)
+                    if new_threshold != threshold:
+                        code_changes.append({
+                            "file": "analysis/factor_weights.json",
+                            "function": "",
+                            "old_code": f'"threshold": {threshold}',
+                            "new_code": f'"threshold": {new_threshold}',
+                            "reason": f"仅{total_trades}笔交易，降低{tf}线阈值{threshold}→{new_threshold}增加交易频率",
+                        })
 
     # ── 2. agents/decision.py 常量调整 ──
     decision_path = os.path.join(project_root, "agents", "decision.py")
@@ -787,6 +835,21 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
         profit_factor = metrics.get("profit_factor", 0)
         total_trades = metrics.get("total_trades", 0)
 
+        # 熊市熔断：回撤>8%且胜率<15%时，禁止降阈值，转为收紧仓位
+        _circuit_breaker = max_dd > 8 and win_rate < 15
+
+        # 读取当前 factor_weights.json 的实际阈值（避免硬编码）
+        _fw_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "analysis", "factor_weights.json")
+        _current_thresholds = {}
+        try:
+            with open(_fw_path, 'r', encoding='utf-8') as _f:
+                _fw = json.load(_f)
+            for _tf in ["short", "mid", "long"]:
+                _current_thresholds[_tf] = _fw.get(_tf, {}).get("threshold", 55)
+        except Exception:
+            _current_thresholds = {"short": 55, "mid": 55, "long": 55}
+
         # 1. 收益率评估
         if total_return > 50:
             pass  # 优秀
@@ -797,7 +860,15 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
             must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中的 base_pos 字典，将 short 对应的值从 20 修改为 30，因为短线仓位过保守导致收益不足。")
         else:
             issues.append(f"负收益{total_return:+.1f}%，系统严重保守或信号错误")
-            must_fix.append("请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 55 修改为 48，因为当前阈值过高导致短线信号过少、错过入场机会。")
+            if _circuit_breaker:
+                must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，禁止降阈值，收紧仓位上限以控制风险。")
+            else:
+                _cur_s = _current_thresholds["short"]
+                if _cur_s > 40:
+                    _new_s = max(40, _cur_s - 3)
+                    must_fix.append(f"请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 {_cur_s} 修改为 {_new_s}，因为当前阈值过高导致短线信号过少、错过入场机会。")
+                else:
+                    issues.append(f"短线阈值已达下限40，无法继续降低，需从仓位管理或止损规则入手")
 
         # 2. 夏普比率评估
         if sharpe < 0:
@@ -812,8 +883,14 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
         # 4. 胜率与交易频率
         if total_trades < 3:
             issues.append(f"仅{total_trades}笔交易，系统过于保守/懒惰")
-            must_fix.append("请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 55 修改为 45，因为交易频率过低说明入场条件过严。")
-            must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 score_strength 的计算公式，降低分母值以放大评分信号。")
+            if _circuit_breaker:
+                must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，收紧仓位控制风险。")
+            else:
+                _cur_s = _current_thresholds["short"]
+                if _cur_s > 40:
+                    _new_s = max(40, _cur_s - 5)
+                    must_fix.append(f"请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 {_cur_s} 修改为 {_new_s}，因为交易频率过低说明入场条件过严。")
+                must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 score_strength 的计算公式，降低分母值以放大评分信号。")
         elif win_rate < 30:
             issues.append(f"胜率仅{win_rate:.0f}%，信号质量差")
             must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中的趋势过滤条件，将 BEAR 判断从仅限制 short/mid 改为三线全部限制，因为熊市环境下信号质量差。")
@@ -823,15 +900,30 @@ def critique_backtest(backtest_result: dict, use_mock: bool = True) -> dict:
         if metrics.get("achievement_short", 0) < 30:
             issues.append(f"短线达成率{metrics['achievement_short']:.0f}%过低，短线策略失效")
             target_achievement["short"] = False
-            must_fix.append("请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 55 修改为 48，因为短线达成率过低说明入场信号不足。")
+            if _circuit_breaker:
+                must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，收紧仓位控制风险。")
+            else:
+                _cur_s = _current_thresholds["short"]
+                if _cur_s > 40:
+                    _new_s = max(40, _cur_s - 3)
+                    must_fix.append(f"请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 {_cur_s} 修改为 {_new_s}，因为短线达成率过低说明入场信号不足。")
         if metrics.get("achievement_mid", 0) < 30:
             issues.append(f"中线达成率{metrics['achievement_mid']:.0f}%过低，中线策略失效")
             target_achievement["mid"] = False
-            must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 mid 线的 weekly_state 判断条件，将其从 'UP' 放宽为 'UP 或 UNKNOWN'，因为周线过滤过严导致中线信号被误杀。")
+            if _circuit_breaker:
+                must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，收紧仓位控制风险。")
+            else:
+                must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 mid 线的 weekly_state 判断条件，将其从 'UP' 放宽为 'UP 或 UNKNOWN'，因为周线过滤过严导致中线信号被误杀。")
         if metrics.get("achievement_long", 0) < 30:
             issues.append(f"长线达成率{metrics['achievement_long']:.0f}%过低，长线策略失效")
             target_achievement["long"] = False
-            must_fix.append("请打开 analysis/factor_weights.json，找到 long 对象中的 threshold，将其从 55 修改为 50，因为长线阈值过高导致无法捕捉长期趋势机会。")
+            if _circuit_breaker:
+                must_fix.append("请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，收紧仓位控制风险。")
+            else:
+                _cur_l = _current_thresholds["long"]
+                if _cur_l > 40:
+                    _new_l = max(40, _cur_l - 3)
+                    must_fix.append(f"请打开 analysis/factor_weights.json，找到 long 对象中的 threshold，将其从 {_cur_l} 修改为 {_new_l}，因为长线阈值过高导致无法捕捉长期趋势机会。")
 
         # 6. 亏损交易分析
         loss_trades = [t for t in closed_trades if t["pnl"] < 0]

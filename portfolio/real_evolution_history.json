@@ -1,0 +1,103 @@
+[
+  {
+    "timestamp": "2026-05-14T19:47:17.133637",
+    "metrics": {
+      "total_return_pct": -31.76,
+      "max_drawdown_pct": 31.76,
+      "sharpe_ratio": 0.0,
+      "win_rate_pct": 0,
+      "profit_factor": 0.0,
+      "total_trades": 0,
+      "win_trades": 0,
+      "loss_trades": 0,
+      "total_realized_pnl": 0,
+      "unrealized_pnl": 2021.2,
+      "achievement_short": 0,
+      "achievement_mid": 0,
+      "achievement_long": 0,
+      "final_equity": 68236.0,
+      "annualized_return": 0.0
+    },
+    "score": 1,
+    "main_issue": "负收益-31.8%，系统严重保守或信号错误",
+    "must_fix": [
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，禁止降阈值，收紧仓位上限以控制风险。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 50，因为单线仓位过大导致回撤失控。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，收紧仓位控制风险。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，收紧仓位控制风险。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 position_pct 计算的上限值，将其从 80 修改为 35，因为回撤>8%且胜率<15%触发熔断，收紧仓位控制风险。"
+    ],
+    "circuit_breakers": [
+      {
+        "type": "max_drawdown_breach",
+        "drawdown": 31.8,
+        "limit": 15,
+        "action": "回撤31.8%超过15%，应清仓短线和中线"
+      }
+    ],
+    "operations_applied": 1
+  },
+  {
+    "timestamp": "2026-05-14T20:00:52.462328",
+    "metrics": {
+      "total_return_pct": 3.05,
+      "max_drawdown_pct": 0.0,
+      "sharpe_ratio": 0.0,
+      "win_rate_pct": -1,
+      "profit_factor": 0,
+      "total_trades": 1,
+      "win_trades": 0,
+      "loss_trades": 0,
+      "total_realized_pnl": 0,
+      "unrealized_pnl": 2021.2,
+      "achievement_short": 0,
+      "achievement_mid": 0,
+      "achievement_long": 0,
+      "final_equity": 68236.0,
+      "invested_capital": 66214.8,
+      "annualized_return": 0.0
+    },
+    "score": 3,
+    "main_issue": "收益率仅+3.0%，缺乏进攻性",
+    "must_fix": [
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中的 base_pos 字典，将 short 对应的值从 20 修改为 30，因为短线仓位过保守导致收益不足。",
+      "请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 46.0 修改为 41.0，因为交易频率过低说明入场条件过严。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 score_strength 的计算公式，降低分母值以放大评分信号。",
+      "请打开 analysis/factor_weights.json，找到 short 对象中的 threshold，将其从 46.0 修改为 43.0，因为短线达成率过低说明入场信号不足。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 mid 线的 weekly_state 判断条件，将其从 'UP' 放宽为 'UP 或 UNKNOWN'，因为周线过滤过严导致中线信号被误杀。"
+    ],
+    "circuit_breakers": [],
+    "operations_applied": 2
+  },
+  {
+    "timestamp": "2026-05-14T20:22:06.851095",
+    "metrics": {
+      "total_return_pct": 3.05,
+      "max_drawdown_pct": 0.0,
+      "sharpe_ratio": 0.0,
+      "win_rate_pct": -1,
+      "profit_factor": 0,
+      "total_trades": 1,
+      "win_trades": 0,
+      "loss_trades": 0,
+      "total_realized_pnl": 0,
+      "unrealized_pnl": 2021.2,
+      "achievement_short": 0,
+      "achievement_mid": 0,
+      "achievement_long": 0,
+      "final_equity": 68236.0,
+      "invested_capital": 66214.8,
+      "annualized_return": 0.0
+    },
+    "score": 3,
+    "main_issue": "收益率仅+3.0%，缺乏进攻性",
+    "must_fix": [
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中的 base_pos 字典，将 short 对应的值从 20 修改为 30，因为短线仓位过保守导致收益不足。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 score_strength 的计算公式，降低分母值以放大评分信号。",
+      "请打开 agents/decision.py，找到 generate_factor_signal 函数中 mid 线的 weekly_state 判断条件，将其从 'UP' 放宽为 'UP 或 UNKNOWN'，因为周线过滤过严导致中线信号被误杀。",
+      "请打开 analysis/factor_weights.json，找到 long 对象中的 threshold，将其从 53.0 修改为 50.0，因为长线阈值过高导致无法捕捉长期趋势机会。"
+    ],
+    "circuit_breakers": [],
+    "operations_applied": 0
+  }
+]

@@ -25,6 +25,16 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from stockstats import StockDataFrame
 import akshare as ak
 
+# 数据库集成（可选，缺失时退化为纯API模式）
+try:
+    from data.database import (
+        init_db as _init_db, save_kline as _db_save_kline,
+        load_kline as _db_load_kline, save_stock_info as _db_save_stock_info,
+    )
+    _HAS_DB = True
+except ImportError:
+    _HAS_DB = False
+
 # ── 配置 ──────────────────────────────────────────────────
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -132,6 +142,21 @@ def fetch_spot(symbol, exchange):
 # ── 2. 历史K线 + 技术指标 ─────────────────────────────────
 @retry(max_attempts=3)
 def fetch_kline_indicators(symbol, exchange, ndays=120):
+    # DB优先：尝试从本地数据库读取K线并计算指标
+    if _HAS_DB:
+        try:
+            df_db = _db_load_kline(symbol)
+            if len(df_db) >= 60:
+                df_db['date'] = pd.to_datetime(df_db['date'])
+                df_db = df_db.sort_values('date').reset_index(drop=True)
+                df_db = df_db.dropna(subset=["close"])
+                if len(df_db) >= 5:
+                    indicators = _compute_indicators_from_df(df_db.tail(ndays))
+                    if indicators and not indicators.get("error"):
+                        return indicators
+        except Exception:
+            pass  # 降级到API
+
     code = f"{exchange}{symbol}"
     kline_url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{ndays},qfq"
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
@@ -158,6 +183,14 @@ def fetch_kline_indicators(symbol, exchange, ndays=120):
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
     df = df.dropna(subset=["close"])
+
+    # API获取成功后自动存入数据库
+    if _HAS_DB:
+        try:
+            _db_save_kline(symbol, df)
+        except Exception:
+            pass
+
     if len(df) < 5:
         return {"error": f"K线数据不足（仅{len(df)}条）"}
 
@@ -770,6 +803,16 @@ def get_compressed_data(symbol: str, market: str = "A") -> dict:
             print(f"  ⚠ {name} 获取失败: {e}")
             result[name] = _DEFAULT_RESULT.get(name, {"error": str(e)})
 
+    # 自动保存股票基本信息到数据库
+    if _HAS_DB:
+        try:
+            q = result.get("quote", {})
+            stock_name = q.get("name", "")
+            if stock_name:
+                _db_save_stock_info(symbol, stock_name)
+        except Exception:
+            pass
+
     # 计算突破入场信号
     result["breakout_signals"] = _compute_breakout_signals(result)
 
@@ -849,6 +892,14 @@ def download_full_history(symbol: str, ndays: int = 800) -> str:
     df = df.dropna(subset=["close"])
 
     df.to_csv(cache_path, index=False)
+
+    # 同步存入数据库
+    if _HAS_DB:
+        try:
+            _db_save_kline(sym, df)
+        except Exception:
+            pass
+
     print(f"  [历史数据] 已缓存 {len(df)} 条日线 → {cache_path}")
     return cache_path
 

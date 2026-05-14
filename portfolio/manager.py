@@ -162,6 +162,16 @@ def remove_position(symbol: str, sell_price: float, quantity: int) -> dict:
     raise ValueError(f"未找到 {symbol} 的持仓")
 
 
+def update_cash(new_cash: float):
+    """直接更新现金余额（用于手动调整）。"""
+    pf = load_portfolio()
+    pf["cash"] = float(new_cash)
+    pf["total_assets"] = pf["cash"] + sum(
+        p["entry_price"] * p["quantity"] for p in pf["positions"]
+    )
+    save_portfolio(pf)
+
+
 def get_portfolio_summary(current_prices: dict = None) -> dict:
     """
     返回总资产、总市值、现金、总盈亏比例等摘要。

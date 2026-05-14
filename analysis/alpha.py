@@ -27,15 +27,16 @@ FACTOR_WEIGHTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 # ── 默认因子权重（若 factor_weights.json 不存在） ──
 DEFAULT_WEIGHTS = {
     "short": {
-        "momentum_20d": 0.20,
-        "momentum_60d": 0.10,
-        "volatility_20d": -0.10,
-        "avg_turnover_20d": 0.10,
-        "breakout_20d_high": 0.15,
-        "volume_ratio": 0.10,
-        "north_flow_days": 0.10,
-        "margin_change": 0.05,
-        "ma_bull_alignment": 0.10,
+        "momentum_20d": 0.18,
+        "momentum_60d": 0.09,
+        "volatility_20d": -0.09,
+        "avg_turnover_20d": 0.09,
+        "breakout_20d_high": 0.135,
+        "volume_ratio": 0.09,
+        "north_flow_days": 0.09,
+        "margin_change": 0.045,
+        "ma_bull_alignment": 0.09,
+        "market_cap_factor": 0.10,
         "threshold": 55,
     },
     "mid": {
@@ -736,7 +737,7 @@ def calc_all_factors(symbol: str, market: str = "A",
 
 
 def composite_score(factors: dict, time_frame: str = "mid",
-                    weight_profile: str = "default") -> dict:
+                    weight_profile: str = "default", df: pd.DataFrame = None) -> dict:
     """
     根据时间框架的因子权重计算综合评分。
 
@@ -755,7 +756,7 @@ def composite_score(factors: dict, time_frame: str = "mid",
         }
     """
     if weight_profile == "aggressive":
-        return _composite_score_aggressive(factors, time_frame)
+        return _composite_score_aggressive(factors, time_frame, df=df)
 
     weights_cfg = _load_weights()
     tf_weights = weights_cfg.get(time_frame, DEFAULT_WEIGHTS.get(time_frame, {}))
@@ -772,6 +773,9 @@ def composite_score(factors: dict, time_frame: str = "mid",
         if raw is None:
             contributions[fname] = 0
             continue
+        # 波动率自适应：用映射后的分数替代原始值参与Z-score
+        if fname == "volatility_20d" and df is not None:
+            raw = _map_traditional_factor(fname, raw, df=df)
         # Z-score 标准化
         z = _zscore(raw, fname)
         if z is None:
@@ -889,7 +893,7 @@ _CATEGORY_SUB_WEIGHTS = {
 }
 
 
-def _composite_score_aggressive(factors: dict, time_frame: str) -> dict:
+def _composite_score_aggressive(factors: dict, time_frame: str, df: pd.DataFrame = None) -> dict:
     """
     攻击性四因子综合评分:
     主力痕迹(30%) + 热点引擎(25%) + 未来空间(20%) + 基本质量(25%)
@@ -920,7 +924,7 @@ def _composite_score_aggressive(factors: dict, time_frame: str) -> dict:
                 factor_score = min(10.0, max(0.0, float(raw)))
             else:
                 # 传统因子：映射到 0~10
-                factor_score = _map_traditional_factor(fname, raw)
+                factor_score = _map_traditional_factor(fname, raw, df=df)
 
             weighted = factor_score * sub_w
             cat_score += weighted
@@ -975,7 +979,7 @@ def _composite_score_aggressive(factors: dict, time_frame: str) -> dict:
     }
 
 
-def _map_traditional_factor(fname: str, raw: float) -> float:
+def _map_traditional_factor(fname: str, raw: float, df: pd.DataFrame = None) -> float:
     """将传统因子的原始值映射到 0~10 区间。"""
     if raw is None:
         return 0.0
@@ -993,7 +997,7 @@ def _map_traditional_factor(fname: str, raw: float) -> float:
     elif fname == "gross_margin_trend":
         return max(0, min(10, 5 + raw / 4))
     elif fname == "volatility_20d":
-        return max(0, min(10, 10 - raw / 10))  # 低波动高分
+        return _adaptive_volatility_score(raw, df)
     elif fname == "pe_percentile":
         return max(0, min(10, 10 - raw * 10))  # 低PE高分
     elif fname == "pb_percentile":
@@ -1006,6 +1010,50 @@ def _map_traditional_factor(fname: str, raw: float) -> float:
         return max(0, min(10, raw * 10))
     else:
         return max(0, min(10, 5 + float(raw)))
+
+
+def _adaptive_volatility_score(current_vol: float, df: pd.DataFrame = None) -> float:
+    """波动率自适应评分：根据股票历史波动率特征分档处理。
+
+    - 高波动标的（历史年化>30%）：当前波动不高于历史1.3倍不扣分
+    - 低波动标的（历史年化<15%）：当前波动突然放大>25%加重扣分
+    - 其他情况：使用标准线性映射
+    """
+    if df is None or len(df) < 60:
+        # 无历史数据，使用标准映射
+        return max(0, min(10, 10 - current_vol / 10))
+
+    # 计算历史年化波动率分布（60日滚动窗口）
+    close = df["close"]
+    daily_ret = close.pct_change().dropna()
+    if len(daily_ret) < 60:
+        return max(0, min(10, 10 - current_vol / 10))
+
+    hist_vol_series = daily_ret.rolling(60).std() * math.sqrt(252) * 100
+    hist_vol_series = hist_vol_series.dropna()
+    if len(hist_vol_series) < 10:
+        return max(0, min(10, 10 - current_vol / 10))
+
+    hist_mean = float(hist_vol_series.mean())
+
+    # 高波动标的：历史年化>30%，天然高波动
+    if hist_mean > 30:
+        if current_vol <= hist_mean * 1.3:
+            return 7.0  # 正常波动，不扣分
+        else:
+            # 超出历史均值1.3倍，按超出比例扣分
+            excess = (current_vol - hist_mean * 1.3) / 10
+            return max(0, min(10, 7 - excess))
+
+    # 低波动标的：历史年化<15%
+    if hist_mean < 15:
+        if current_vol > 25:
+            return 1.0  # 低波动股突然剧烈波动，重扣
+        else:
+            return max(0, min(10, 10 - current_vol / 8))
+
+    # 中等波动标的：标准映射
+    return max(0, min(10, 10 - current_vol / 10))
 
 
 def rank_stocks(universe: list = None, top_n: int = 50,
@@ -1048,7 +1096,11 @@ def rank_stocks(universe: list = None, top_n: int = 50,
         completed += 1
         try:
             factors = calc_all_factors(sym)
-            comp = composite_score(factors, time_frame)
+            try:
+                df = _load_history_df(sym)
+            except Exception:
+                df = None
+            comp = composite_score(factors, time_frame, df=df)
             results.append({
                 "symbol": sym,
                 "name": spots.get(sym, {}).get("name", ""),
@@ -1077,6 +1129,12 @@ def _print_factors(symbol: str):
     """打印单只股票的所有因子详情。"""
     factors = calc_all_factors(symbol)
     meta = factors.pop("_meta", {})
+    try:
+        from data.pipeline import normalize_symbol
+        sym, _ = normalize_symbol(symbol)
+        df = _load_history_df(sym)
+    except Exception:
+        df = None
 
     print(f"\n{'='*60}")
     print(f"  Alpha 因子报告: {symbol}")
@@ -1131,7 +1189,7 @@ def _print_factors(symbol: str):
                "CAUTIOUS_SELL": "谨慎卖出", "SELL": "卖出"}
     print(f"\n  ── 传统因子权重 ──")
     for tf in ["short", "mid", "long"]:
-        comp = composite_score(factors, tf, weight_profile="default")
+        comp = composite_score(factors, tf, weight_profile="default", df=df)
         print(f"  [{tf}线] 综合评分: {comp['score']:.1f}/100 "
               f"→ {sig_map.get(comp['signal'], comp['signal'])} (阈值={comp['threshold']})")
         top_contrib = sorted(comp["contributions"].items(), key=lambda x: abs(x[1]), reverse=True)[:5]
@@ -1141,7 +1199,7 @@ def _print_factors(symbol: str):
     # 综合评分 — 攻击性权重
     print(f"\n  ── 攻击性四因子权重 (主力30%/热点25%/空间20%/质量25%) ──")
     for tf in ["short", "mid", "long"]:
-        comp = composite_score(factors, tf, weight_profile="aggressive")
+        comp = composite_score(factors, tf, weight_profile="aggressive", df=df)
         cats = comp.get("category_scores", {})
         cat_str = " | ".join(f"{k}={v:.1f}" for k, v in cats.items())
         print(f"  [{tf}线] 综合评分: {comp['score']:.1f}/100 "
@@ -1191,7 +1249,13 @@ if __name__ == "__main__":
         if args.json:
             factors = calc_all_factors(args.symbol)
             factors.pop("_meta", None)
-            comp = composite_score(factors, args.timeframe)
+            try:
+                from data.pipeline import normalize_symbol as _ns
+                _s, _ = _ns(args.symbol)
+                _df = _load_history_df(_s)
+            except Exception:
+                _df = None
+            comp = composite_score(factors, args.timeframe, df=_df)
             print(json.dumps({"factors": factors, "composite": comp}, ensure_ascii=False, indent=2))
         else:
             _print_factors(args.symbol)

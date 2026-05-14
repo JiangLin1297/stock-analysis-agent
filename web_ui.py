@@ -1,6 +1,6 @@
 """
 StockMind Web UI — Streamlit 全功能网页应用
-替换桌面端，提供深度分析、智能选股、回测、持仓管理、策略基因库。
+替换桌面端，提供深度分析、智能选股、回测、持仓管理、策略基因库、实盘进化。
 启动: python -m streamlit run web_ui.py --server.port 8501
 """
 
@@ -62,10 +62,22 @@ DEFAULTS = {
     # Batch deep analysis state
     "_batch_results": None,
     "_batch_running": False,
+    # Navigation context
+    "bt_symbol": "600744",
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# 启动后台数据任务（首次启动下载CSI300+K线，后续增量更新）
+if "_db_initialized" not in st.session_state:
+    try:
+        from data.database import start_background_data_task
+        start_background_data_task()
+        st.session_state["_db_initialized"] = True
+    except Exception as _e:
+        print(f"[DB] 初始化失败: {_e}")
+        st.session_state["_db_initialized"] = True
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -116,6 +128,18 @@ def _sanitize(text: str, max_len: int = 200) -> str:
     text = str(text)
     text = re.sub(r"<[^>]+>", "", text)
     return text[:max_len] if max_len else text
+
+
+def navigate_to(page: str, symbol: str = None, extra: dict = None):
+    """跨页面跳转，携带上下文。"""
+    st.session_state.page = page
+    if symbol:
+        st.session_state.deep_symbol = symbol
+        st.session_state["_nav_symbol"] = symbol
+    if extra:
+        for k, v in extra.items():
+            st.session_state[k] = v
+    st.rerun()
 
 
 def decision_card(label, dim):
@@ -219,8 +243,8 @@ with st.sidebar:
     st.title("StockMind")
     st.caption("多Agent智能股析系统")
 
-    pages = ["日常顾问", "深度分析", "智能选股", "回测实验室", "持仓管理", "策略基因库"]
-    icons = ["📋", "🔬", "🔍", "⚗️", "💼", "🧬"]
+    pages = ["日常顾问", "深度分析", "智能选股", "回测实验室", "持仓管理", "策略基因库", "实盘进化", "历史记录"]
+    icons = ["📋", "🔬", "🔍", "⚗️", "💼", "🧬", "🛡️", "📜"]
 
     for i, (page, icon) in enumerate(zip(pages, icons)):
         if st.sidebar.button(
@@ -265,6 +289,21 @@ with st.sidebar:
     if news_key not in st.session_state:
         st.session_state[news_key] = "未知"
     st.caption(f"📰 新闻: {st.session_state[news_key]}")
+
+    # ── 数据库状态 ──
+    db_key = "_db_status"
+    if db_key not in st.session_state:
+        try:
+            from data.database import get_db_stats
+            _db_s = get_db_stats()
+            if _db_s.get("initialized"):
+                _last = _db_s.get("last_incremental") or _db_s.get("last_full_download") or ""
+                st.session_state[db_key] = f"DB: {_db_s['stocks']}股/{_db_s['klines']}条K线 ({_last[:10]})"
+            else:
+                st.session_state[db_key] = "DB: 初始化中..."
+        except Exception:
+            st.session_state[db_key] = "DB: 不可用"
+    st.caption(f"💾 {st.session_state[db_key]}")
 
     st.divider()
     st.caption(f"{datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -412,6 +451,21 @@ if current_page == "深度分析":
             if shared["news_status"]:
                 st.session_state["_news_status"] = shared["news_status"]
             st.session_state["_analysis_running"] = False
+            # 自动保存到数据库历史记录
+            if shared["result"] and not shared["error"]:
+                try:
+                    from data.database import save_analysis_result as _save_ar
+                    _sym = st.session_state.get("_analysis_symbol", "")
+                    _info = {}
+                    try:
+                        from data.database import get_stock_info
+                        _info = get_stock_info(_sym)
+                    except Exception:
+                        pass
+                    _name = _info.get("name", _sym)
+                    _save_ar(_sym, _name, "深度分析", shared["result"])
+                except Exception:
+                    pass
             st.rerun()
 
         symbol = st.session_state["_analysis_symbol"]
@@ -526,6 +580,34 @@ if current_page == "深度分析":
                             st.caption("因子贡献数据未生成 (使用旧版LLM管线)")
 
             verdict = decision.get("overall_verdict", "")
+
+            # ── 个股主力基因卡 ──
+            try:
+                from data.database import get_stock_gene
+                sym = result.get("symbol", "")
+                if sym:
+                    gene = get_stock_gene(sym)
+                    if gene and gene.get("sample_count", 0) > 0:
+                        with st.expander("🧬 个股主力基因", expanded=False):
+                            g1, g2, g3, g4 = st.columns(4)
+                            g1.metric("MA60对齐天数", f"{gene.get('avg_ma60_alignment_days', 0):.1f}")
+                            g2.metric("假突破概率", f"{gene.get('avg_false_breakout_prob', 0):.0%}")
+                            g3.metric("洗盘量比", f"{gene.get('avg_washout_volume_ratio', 0):.2f}")
+                            g4.metric("回调深度", f"{gene.get('avg_pullback_depth', 0):.1f}%")
+                            g5, g6, g7, g8 = st.columns(4)
+                            g5.metric("反弹强度", f"{gene.get('avg_rally_strength', 0):.2f}")
+                            g6.metric("ATR水平", f"{gene.get('avg_atr_level', 0):.1f}%")
+                            g7.metric("缺口反应", f"{gene.get('avg_gap_reaction', 0):.1f}%")
+                            g8.metric("置信度", f"{gene.get('confidence_score', 0):.0f}/100")
+                            st.caption(f"样本数: {gene.get('sample_count', 0)} | 更新: {gene.get('updated_at', 'N/A')}")
+
+                            gene_adj = decision.get("_gene_adjustments", [])
+                            if gene_adj:
+                                st.success("已根据个股基因调整参数: " + "; ".join(gene_adj))
+                            else:
+                                st.caption("基因数据暂不足以调整参数，继续积累样本中")
+            except Exception:
+                pass
             if verdict:
                 st.info(f"综合裁决: {verdict}")
 
@@ -574,12 +656,55 @@ if current_page == "深度分析":
     if not st.session_state["_analysis_running"] and st.session_state.get("_analysis_result") is None:
         col1, col2, col3 = st.columns([3, 1, 1])
         with col1:
-            symbol = st.text_input(
-                "股票代码",
-                value=st.session_state.deep_symbol or "000001",
-                max_chars=6,
-                key="deep_symbol_input",
-            )
+            # 构建候选列表：持仓 + 选股结果 + 数据库搜索
+            _options = []
+            _pf = st.session_state.get("portfolio_data") or {}
+            for _p in _pf.get("positions", []):
+                _s = _p.get("symbol", "")
+                _n = _p.get("name", _s)
+                if _s:
+                    _options.append(f"{_s} {_n}")
+            for _s_item in st.session_state.get("screen_results", []):
+                _s = _s_item.get("symbol", "")
+                _n = _s_item.get("name", _s)
+                if _s and f"{_s} {_n}" not in _options:
+                    _options.append(f"{_s} {_n}")
+
+            # 数据库模糊搜索
+            _nav_sym = st.session_state.get("_nav_symbol", "")
+            if _nav_sym:
+                try:
+                    from data.database import search_symbol as _db_search
+                    for _r in _db_search(_nav_sym):
+                        _combo = f"{_r['symbol']} {_r.get('name', '')}"
+                        if _combo not in _options:
+                            _options.append(_combo)
+                except Exception:
+                    pass
+
+            if _options:
+                _selected = st.selectbox(
+                    "选择股票（持仓/选股/手动输入）",
+                    options=["手动输入"] + _options,
+                    key="deep_select_box",
+                )
+                if _selected != "手动输入":
+                    symbol = _selected.split()[0]
+                    st.session_state.deep_symbol = symbol
+                else:
+                    symbol = st.text_input(
+                        "股票代码",
+                        value=st.session_state.deep_symbol or "000001",
+                        max_chars=6,
+                        key="deep_symbol_input",
+                    )
+            else:
+                symbol = st.text_input(
+                    "股票代码",
+                    value=st.session_state.deep_symbol or "000001",
+                    max_chars=6,
+                    key="deep_symbol_input",
+                )
         with col2:
             use_mock = st.checkbox("Mock模式", value=True, help="不调用LLM API，快速本地分析")
         with col3:
@@ -672,6 +797,12 @@ elif current_page == "智能选股":
 
         st.session_state.screen_results = results
         st.session_state.screen_scope = scope
+        # 自动保存选股结果到数据库
+        try:
+            from data.database import save_screening_result as _save_sr
+            _save_sr(results[:5], scope=scope)
+        except Exception:
+            pass
         st.success(f"共筛选出 {len(results)} 只股票")
 
         import pandas as pd
@@ -765,7 +896,7 @@ elif current_page == "智能选股":
                 st.rerun()
 
         st.divider()
-        st.caption("点击跳转到深度分析")
+        st.subheader("快速操作")
         cols = st.columns(min(len(results), 6))
         for i, stock in enumerate(results[:12]):
             sym = stock.get("symbol", "?")
@@ -776,9 +907,7 @@ elif current_page == "智能选股":
             with cols[i % 6]:
                 label = f"{sym} {name}\n{score:.0f}分 {tag_str}" if tag_str else f"{sym} {name}\n{score:.0f}分"
                 if st.button(label, key=f"goto_{sym}", use_container_width=True):
-                    st.session_state.deep_symbol = sym
-                    st.session_state.page = "深度分析"
-                    st.rerun()
+                    navigate_to("深度分析", symbol=sym)
 
     elif st.session_state.screen_results:
         st.divider()
@@ -871,7 +1000,7 @@ elif current_page == "回测实验室":
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        bt_symbol = st.text_input("股票代码", value="600744", max_chars=6, key="bt_symbol")
+        bt_symbol = st.text_input("股票代码", value=st.session_state.get("bt_symbol", "600744"), max_chars=6, key="bt_symbol")
     with col2:
         bt_timeframe = st.selectbox(
             "时间维度",
@@ -931,7 +1060,8 @@ elif current_page == "回测实验室":
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("总收益", f"{m.get('total_return_pct', 0):+.2f}%")
                     c2.metric("夏普比率", f"{m.get('sharpe_ratio', 0):.2f}")
-                    c3.metric("胜率", f"{m.get('win_rate_pct', 0):.1f}%")
+                    _wr = m.get('win_rate_pct', -1)
+                    c3.metric("胜率", f"{_wr:.1f}%" if _wr >= 0 else "N/A")
                     c4.metric("Critic评分", f"{score:.1f}/100")
                     dd = m.get("max_drawdown_pct", 0)
                     ach_s = m.get("achievement_short", 0)
@@ -975,7 +1105,8 @@ elif current_page == "持仓管理":
         do_refresh = st.button("🔄 刷新数据", use_container_width=True)
 
     try:
-        from portfolio.manager import load_portfolio, get_portfolio_summary, add_position, remove_position
+        from portfolio.manager import load_portfolio, get_portfolio_summary, add_position, remove_position, update_cash
+        from portfolio.trade_logger import record_trade
 
         pf = load_portfolio(refresh=do_refresh)
         summary = get_portfolio_summary()
@@ -986,7 +1117,19 @@ elif current_page == "持仓管理":
         with c1:
             st.metric("总资产", f"{summary.get('total_assets', 0):,.2f}")
         with c2:
-            st.metric("现金", f"{summary.get('cash', 0):,.2f}")
+            with st.form("edit_cash_form", clear_on_submit=False):
+                new_cash_val = st.number_input(
+                    "现金余额", min_value=0.0,
+                    value=float(summary.get('cash', 0)),
+                    step=1000.0, key="edit_cash_input"
+                )
+                if st.form_submit_button("💾 保存现金"):
+                    try:
+                        update_cash(new_cash_val)
+                        st.success(f"现金已更新为 {new_cash_val:,.2f}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"更新失败: {e}")
         with c3:
             st.metric("持仓市值", f"{summary.get('market_value', 0):,.2f}")
         with c4:
@@ -1017,22 +1160,56 @@ elif current_page == "持仓管理":
                 cost = entry * qty
                 pnl_pct_pos = (pnl / cost * 100) if cost > 0 else 0
                 with st.container():
-                    c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
+                    c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 1, 2])
                     c1.subheader(f"{sym} {name}")
                     c2.metric("成本价", f"{entry:.4f}")
                     c3.metric("现价", f"{current:.4f}")
                     c4.metric("数量", f"{qty}股")
                     c5.metric("盈亏", f"{pnl:+,.2f}", delta=f"{pnl_pct_pos:+.2f}%")
+                    with c6:
+                        ba, bb = st.columns(2)
+                        if ba.button("深度分析", key=f"pf_deep_{sym}"):
+                            navigate_to("深度分析", symbol=sym)
+                        if bb.button("回测", key=f"pf_bt_{sym}"):
+                            navigate_to("回测实验室", symbol=sym, extra={"bt_symbol": sym})
+                        bc, bd = st.columns(2)
+                        if bc.button("策略基因", key=f"pf_gene_{sym}"):
+                            navigate_to("策略基因库", symbol=sym)
+                        if bd.button("实盘进化", key=f"pf_evo_{sym}"):
+                            navigate_to("实盘进化", symbol=sym)
                 st.divider()
 
         st.divider()
         st.subheader("➕ 新增持仓")
+
+        # 模糊搜索股票
+        _search_kw = st.text_input("搜索股票（输入代码或名称）", key="pf_search_kw", max_chars=20)
+        _search_results = []
+        if _search_kw and len(_search_kw) >= 1:
+            try:
+                from data.database import search_symbol as _pf_search
+                _search_results = _pf_search(_search_kw)
+            except Exception:
+                pass
+        if _search_results:
+            _opts = [f"{r['symbol']} {r.get('name', '')}" for r in _search_results]
+            _picked = st.selectbox("匹配结果（选择后自动填充）", options=[""] + _opts, key="pf_pick")
+            if _picked:
+                _picked_sym = _picked.split()[0]
+                _picked_name = _picked.split(" ", 1)[1] if " " in _picked else ""
+            else:
+                _picked_sym = ""
+                _picked_name = ""
+        else:
+            _picked_sym = ""
+            _picked_name = ""
+
         with st.form("add_position_form", clear_on_submit=True):
             ca, cb, cc, cd = st.columns(4)
             with ca:
-                new_sym = st.text_input("股票代码", max_chars=6, key="new_sym")
+                new_sym = st.text_input("股票代码", value=_picked_sym, max_chars=6, key="new_sym")
             with cb:
-                new_name = st.text_input("名称(可选)", key="new_name")
+                new_name = st.text_input("名称(可选)", value=_picked_name, key="new_name")
             with cc:
                 new_price = st.number_input("入场价", min_value=0.01, value=10.0, step=0.01, key="new_price")
             with cd:
@@ -1041,7 +1218,17 @@ elif current_page == "持仓管理":
                 if new_sym.strip():
                     try:
                         add_position(new_sym.strip(), float(new_price), int(new_qty), name=new_name.strip())
-                        st.success(f"已添加 {new_sym} x {new_qty}股 @ {new_price}")
+                        record_trade({
+                            "symbol": new_sym.strip(),
+                            "action": "BUY",
+                            "price": float(new_price),
+                            "quantity": int(new_qty),
+                            "reason": "用户手动录入持仓",
+                            "pnl": 0.0,
+                            "time_frame": "mid",
+                            "name": new_name.strip() or new_sym.strip(),
+                        })
+                        st.success(f"已添加 {new_sym} x {new_qty}股 @ {new_price}，实盘交易记录已同步")
                         st.rerun()
                     except ValueError as ve:
                         st.error(f"添加失败: {ve}")
@@ -1064,15 +1251,84 @@ elif current_page == "持仓管理":
                     try:
                         sym_only = sell_sym.split()[0]
                         result = remove_position(sym_only, float(sell_price), int(sell_qty))
+                        record_trade({
+                            "symbol": sym_only,
+                            "action": "SELL",
+                            "price": float(sell_price),
+                            "quantity": int(sell_qty),
+                            "reason": "用户手动卖出持仓",
+                            "pnl": result['realized_pnl'],
+                            "time_frame": "mid",
+                        })
                         st.success(
                             f"已卖出 {sym_only} x {sell_qty}股 @ {sell_price}"
                             f" | 实现盈亏: {result['realized_pnl']:+,.2f}"
+                            f" | 实盘交易记录已同步"
                         )
                         st.rerun()
                     except ValueError as ve:
                         st.error(f"卖出失败: {ve}")
                     except Exception as e:
                         st.error(f"卖出失败: {e}")
+                        st.code(traceback.format_exc())
+
+        st.divider()
+        st.subheader("✏️ 修改持仓数量")
+        if positions:
+            with st.form("edit_qty_form", clear_on_submit=True):
+                eq1, eq2, eq3 = st.columns(3)
+                with eq1:
+                    edit_sym = st.selectbox(
+                        "选择持仓",
+                        options=[f"{p['symbol']} {p.get('name','')} (当前{p['quantity']}股)" for p in positions],
+                        key="edit_sym_select"
+                    )
+                with eq2:
+                    edit_new_qty = st.number_input("新数量(股)", min_value=0, value=1000, step=100, key="edit_new_qty")
+                with eq3:
+                    edit_price = st.number_input("调整价格", min_value=0.01, value=10.0, step=0.01, key="edit_price")
+                if st.form_submit_button("确认修改", type="primary"):
+                    try:
+                        sym_only = edit_sym.split()[0]
+                        old_pos = next((p for p in positions if p["symbol"] == sym_only), None)
+                        if not old_pos:
+                            st.error(f"未找到 {sym_only} 的持仓")
+                        else:
+                            old_qty = int(old_pos["quantity"])
+                            delta = edit_new_qty - old_qty
+                            if delta > 0:
+                                add_position(sym_only, float(edit_price), delta, name=old_pos.get("name", ""))
+                                record_trade({
+                                    "symbol": sym_only,
+                                    "action": "BUY",
+                                    "price": float(edit_price),
+                                    "quantity": delta,
+                                    "reason": f"用户手动加仓 {old_qty}→{edit_new_qty}股",
+                                    "pnl": 0.0,
+                                    "time_frame": "mid",
+                                    "name": old_pos.get("name", sym_only),
+                                })
+                                st.success(f"{sym_only} 加仓 +{delta}股，实盘记录已同步")
+                            elif delta < 0:
+                                sell_qty = abs(delta)
+                                result = remove_position(sym_only, float(edit_price), sell_qty)
+                                record_trade({
+                                    "symbol": sym_only,
+                                    "action": "SELL",
+                                    "price": float(edit_price),
+                                    "quantity": sell_qty,
+                                    "reason": f"用户手动减仓 {old_qty}→{edit_new_qty}股",
+                                    "pnl": result['realized_pnl'],
+                                    "time_frame": "mid",
+                                })
+                                st.success(f"{sym_only} 减仓 -{sell_qty}股，实盘记录已同步")
+                            else:
+                                st.info("数量未变化，无需操作")
+                            st.rerun()
+                    except ValueError as ve:
+                        st.error(f"修改失败: {ve}")
+                    except Exception as e:
+                        st.error(f"修改失败: {e}")
                         st.code(traceback.format_exc())
 
     except Exception as e:
@@ -1166,6 +1422,330 @@ elif current_page == "策略基因库":
                         st.code(content[-5000:], language=None)
         except Exception as e:
             st.error(f"读取进化历史失败: {e}")
+
+# ═══════════════════════════════════════════════════════════════
+# 第 7 页: 实盘进化
+# ═══════════════════════════════════════════════════════════════
+if current_page == "实盘进化":
+    st.title("🛡️ 实盘自进化引擎")
+    st.caption("基于真实交易结果，Critic 自动优化策略参数")
+
+    # ── 自动进化开关 ──
+    st.subheader("⚙️ 自动进化设置")
+    from scheduler import is_auto_evolution_enabled, set_auto_evolution
+    auto_enabled = is_auto_evolution_enabled()
+    col_sw, col_info = st.columns([1, 3])
+    with col_sw:
+        new_enabled = st.toggle("每日自动进化", value=auto_enabled,
+                                help="开启后每日 15:30 自动执行 Critic 优化")
+        if new_enabled != auto_enabled:
+            set_auto_evolution(new_enabled)
+            st.success(f"自动进化已{'开启' if new_enabled else '关闭'}")
+    with col_info:
+        st.caption(f"触发条件: 每日 15:30 | 累计浮亏 > 5% | 手动触发")
+        st.caption(f"熔断规则: 单票≤25% | 总仓位≤80% | 连续3亏暂停3天 | 回撤>15%清仓短中线")
+
+    st.divider()
+
+    # ── 手动触发 Critic ──
+    st.subheader("🔬 手动触发 Critic 优化")
+    col_btn, col_days = st.columns([2, 1])
+    with col_days:
+        critic_days = st.selectbox("分析天数", [7, 14, 30, 60], index=2,
+                                   key="real_critic_days")
+    with col_btn:
+        if st.button("🚀 触发实盘 Critic", type="primary", use_container_width=True):
+            with st.spinner("Critic 正在分析实盘交易..."):
+                try:
+                    from agents.real_critic import trigger_real_critic
+                    result = trigger_real_critic(days=critic_days, use_mock=True)
+                    st.session_state["_real_critic_result"] = result
+                except Exception as e:
+                    st.error(f"Critic 执行失败: {e}")
+
+    # 显示 Critic 结果
+    critic_result = st.session_state.get("_real_critic_result")
+    if critic_result:
+        if critic_result.get("error"):
+            st.warning(critic_result["error"])
+        else:
+            m = critic_result.get("metrics", {})
+            cr = critic_result.get("critic_result", {})
+            cbs = critic_result.get("circuit_breakers", [])
+
+            # 核心指标
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("总收益", f"{m.get('total_return_pct', 0):+.2f}%")
+            _wr = m.get('win_rate_pct', -1)
+            c2.metric("胜率", f"{_wr:.1f}%" if _wr >= 0 else "N/A")
+            c3.metric("最大回撤", f"{m.get('max_drawdown_pct', 0):.2f}%")
+            c4.metric("交易笔数", f"{m.get('total_trades', 0)}")
+
+            # Critic 评分
+            score = cr.get("overall_score", 0)
+            st.metric("Critic 评分", f"{score}/10")
+            if cr.get("main_issue"):
+                st.warning(f"主要问题: {cr['main_issue']}")
+
+            # 熔断状态
+            if cbs:
+                st.error(f"⚠️ 熔断触发: {len(cbs)} 条")
+                for cb in cbs:
+                    st.caption(f"  - {cb.get('action', '')}")
+            else:
+                st.success("熔断检查通过")
+
+            # 信号质量
+            sq = critic_result.get("signal_quality", {})
+            if sq and sq.get("evaluated", 0) > 0:
+                st.subheader("📊 历史信号质量")
+                sq1, sq2, sq3, sq4 = st.columns(4)
+                sq1.metric("信号质量评分", f"{sq.get('quality_score', 0)}/10")
+                sq2.metric("5日命中率", f"{sq.get('hit_rate_5d', 0):.0f}%")
+                sq3.metric("平均5日收益", f"{sq.get('avg_return_5d', 0):+.2f}%")
+                sq4.metric("评估信号数", f"{sq.get('evaluated', 0)}")
+
+            # 修改结果
+            ops = critic_result.get("operations_applied", 0)
+            skipped = critic_result.get("skipped_threshold_changes", False)
+            if ops > 0:
+                st.success(f"已应用 {ops} 条参数修改")
+            if skipped:
+                st.info("已拦截阈值修改（严重熔断模式），改为收紧仓位")
+
+            # 修改详情
+            if cr.get("must_fix"):
+                st.subheader("修改指令")
+                for fix in cr["must_fix"]:
+                    st.caption(f"  • {fix}")
+
+    st.divider()
+
+    # ── 近期实盘交易列表 ──
+    st.subheader("📊 近 30 天实盘交易")
+    try:
+        from portfolio.trade_logger import get_recent_trades, get_trades_summary
+        recent = get_recent_trades(30)
+        if recent:
+            summary = get_trades_summary()
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("总交易", f"{summary['total_trades']}笔")
+            sc2.metric("买入", f"{summary['buy_count']}笔")
+            sc3.metric("卖出", f"{summary['sell_count']}笔")
+            sc4.metric("已实现盈亏", f"¥{summary['total_pnl']:,.2f}")
+
+            trade_rows = []
+            for t in reversed(recent[-50:]):
+                action = t.get("action", "").upper()
+                icon = "🟢" if action == "BUY" else "🔴"
+                pnl = float(t.get("pnl", 0))
+                pnl_str = f"{pnl:+,.2f}" if pnl != 0 else "-"
+                trade_rows.append({
+                    "时间": t.get("date", ""),
+                    "股票": t.get("symbol", ""),
+                    "方向": f"{icon} {action}",
+                    "价格": f"{float(t.get('price', 0)):.3f}",
+                    "数量": int(t.get("quantity", 0)),
+                    "盈亏": pnl_str,
+                    "时间框架": t.get("time_frame", ""),
+                    "原因": _sanitize(t.get("reason", ""), 40),
+                })
+            st.dataframe(trade_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无实盘交易记录。通过 record_trade() 记录交易后此处自动显示。")
+    except Exception as e:
+        st.error(f"加载交易记录失败: {e}")
+
+    st.divider()
+
+    # ── 优化历史 ──
+    st.subheader("📜 优化历史")
+    try:
+        from agents.real_critic import get_evolution_history
+        history = get_evolution_history()
+        if history:
+            for rec in reversed(history[-10:]):
+                ts = rec.get("timestamp", "?")[:16]
+                score = rec.get("score", "?")
+                issue = rec.get("main_issue", "")[:60]
+                ops = rec.get("operations_applied", 0)
+                cbs = len(rec.get("circuit_breakers", []))
+                cb_tag = f" | 熔断{cbs}条" if cbs > 0 else ""
+                with st.expander(f"{ts} — 评分{score}/10 | 应用{ops}条{cb_tag}"):
+                    st.caption(f"问题: {issue}")
+                    if rec.get("must_fix"):
+                        for fix in rec["must_fix"]:
+                            st.caption(f"  • {fix}")
+                    m = rec.get("metrics", {})
+                    if m:
+                        _wr = m.get('win_rate_pct', -1)
+                        _wr_s = f"{_wr:.1f}%" if _wr >= 0 else "N/A"
+                        st.caption(f"收益{m.get('total_return_pct', 0):+.2f}% "
+                                   f"胜率{_wr_s} "
+                                   f"回撤{m.get('max_drawdown_pct', 0):.2f}%")
+        else:
+            st.info("暂无优化记录。触发 Critic 优化后此处自动显示。")
+    except Exception as e:
+        st.error(f"加载优化历史失败: {e}")
+
+# ═══════════════════════════════════════════════════════════════
+# 第 8 页: 历史记录
+# ═══════════════════════════════════════════════════════════════
+elif current_page == "历史记录":
+    st.title("📜 历史记录")
+    st.caption("所有分析结果永不丢失，可查看、重新分析、导出")
+
+    try:
+        from data.database import (
+            get_analysis_history, get_screening_history,
+            delete_analysis_record, delete_analysis_records,
+        )
+
+        tab_analysis, tab_screening = st.tabs(["分析记录", "选股记录"])
+
+        # ── 分析记录 Tab ──
+        with tab_analysis:
+            # 筛选器
+            fc1, fc2, fc3 = st.columns([2, 2, 2])
+            with fc1:
+                filter_symbol = st.text_input("股票代码(可选)", key="hist_filter_sym", max_chars=6)
+            with fc2:
+                filter_type = st.selectbox("类型", ["全部", "深度分析", "智能选股", "回测", "实盘进化"],
+                                           key="hist_filter_type")
+            with fc3:
+                filter_limit = st.slider("显示条数", 10, 200, 50, step=10, key="hist_filter_limit")
+
+            type_param = None if filter_type == "全部" else filter_type
+            sym_param = filter_symbol.strip() or None
+            records = get_analysis_history(symbol=sym_param, type_=type_param, limit=filter_limit)
+
+            if not records:
+                st.info("暂无分析记录。执行深度分析或智能选股后自动保存。")
+            else:
+                # 批量操作栏
+                st.divider()
+                sel_col, del_col, exp_col = st.columns([3, 1, 1])
+                selected_ids = []
+                with sel_col:
+                    st.caption(f"共 {len(records)} 条记录")
+                with del_col:
+                    do_delete = st.button("🗑️ 删除选中", key="hist_batch_delete")
+                with exp_col:
+                    do_export_csv = st.button("📥 导出CSV", key="hist_export_csv")
+                    do_export_json = st.button("📥 导出JSON", key="hist_export_json")
+
+                # 记录列表
+                for rec in records:
+                    rid = rec["id"]
+                    sym = rec.get("symbol", "?")
+                    name = rec.get("name", sym)
+                    rtype = rec.get("type", "?")
+                    tf = rec.get("time_frame", "")
+                    created = rec.get("created_at", "?")[:16]
+                    result = rec.get("result", {})
+
+                    # 摘要：从 result 中提取关键信息
+                    summary_parts = []
+                    if rtype == "深度分析":
+                        decision = result.get("final_decision", result)
+                        for tk, tl in [("short_term", "短"), ("mid_term", "中"), ("long_term", "长")]:
+                            dim = decision.get(tk, {})
+                            act = dim.get("action", "?")
+                            score = dim.get("_factor_score", dim.get("score", "?"))
+                            summary_parts.append(f"{tl}:{act}({score})")
+                    elif rtype == "智能选股":
+                        score = result.get("composite_score", result.get("score", "?"))
+                        tags = result.get("signal_tags", [])
+                        summary_parts.append(f"评分:{score} {' '.join(tags[:2])}")
+                    summary_str = " | ".join(summary_parts) if summary_parts else ""
+
+                    with st.container():
+                        rc1, rc2, rc3, rc4, rc5, rc6 = st.columns([0.3, 1.5, 1, 1, 2, 1.5])
+                        with rc1:
+                            checked = st.checkbox("", key=f"hist_chk_{rid}", value=False)
+                            if checked:
+                                selected_ids.append(rid)
+                        with rc2:
+                            st.markdown(f"**{sym} {name}**")
+                        with rc3:
+                            st.caption(f"`{rtype}`")
+                        with rc4:
+                            st.caption(created)
+                        with rc5:
+                            if summary_str:
+                                st.caption(summary_str)
+                        with rc6:
+                            bc1, bc2 = st.columns(2)
+                            with bc1:
+                                if st.button("详情", key=f"hist_detail_{rid}"):
+                                    st.session_state[f"_hist_show_{rid}"] = not st.session_state.get(f"_hist_show_{rid}", False)
+                            with bc2:
+                                if st.button("重分析", key=f"hist_reanalyze_{rid}"):
+                                    navigate_to("深度分析", symbol=sym)
+
+                        # 展开详情
+                        if st.session_state.get(f"_hist_show_{rid}", False):
+                            st.json(result)
+
+                    st.divider()
+
+                # 批量操作执行
+                if do_delete and selected_ids:
+                    delete_analysis_records(selected_ids)
+                    st.success(f"已删除 {len(selected_ids)} 条记录")
+                    st.rerun()
+
+                if do_export_csv:
+                    import pandas as _pd
+                    export_rows = []
+                    for rec in records:
+                        export_rows.append({
+                            "id": rec["id"],
+                            "symbol": rec.get("symbol", ""),
+                            "name": rec.get("name", ""),
+                            "type": rec.get("type", ""),
+                            "time_frame": rec.get("time_frame", ""),
+                            "created_at": rec.get("created_at", ""),
+                            "result_json": json.dumps(rec.get("result", {}), ensure_ascii=False),
+                        })
+                    csv_data = _pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("⬇️ 下载 CSV", csv_data,
+                                       file_name=f"analysis_history_{datetime.now():%Y%m%d}.csv",
+                                       mime="text/csv")
+
+                if do_export_json:
+                    json_data = json.dumps(records, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+                    st.download_button("⬇️ 下载 JSON", json_data,
+                                       file_name=f"analysis_history_{datetime.now():%Y%m%d}.json",
+                                       mime="application/json")
+
+        # ── 选股记录 Tab ──
+        with tab_screening:
+            screen_records = get_screening_history(limit=30)
+            if not screen_records:
+                st.info("暂无选股记录。执行智能选股后自动保存。")
+            else:
+                for rec in screen_records:
+                    created = rec.get("created_at", "?")[:16]
+                    scope_r = rec.get("scope", "?")
+                    top5 = rec.get("top5", [])
+                    top5_count = len(top5)
+                    symbols = ", ".join(s.get("symbol", "?") for s in top5[:5])
+
+                    with st.expander(f"{created} | {scope_r} | {top5_count}只 | {symbols}"):
+                        for i, s in enumerate(top5):
+                            sym = s.get("symbol", "?")
+                            name = s.get("name", sym)
+                            score = s.get("composite_score", s.get("score", 0))
+                            tags = ", ".join(s.get("signal_tags", [])[:3])
+                            st.caption(f"{i+1}. {sym} {name} — {score:.0f}分 | {tags}")
+                        if st.button("重跑选股", key=f"hist_rescreen_{rec['id']}"):
+                            navigate_to("智能选股")
+
+    except Exception as e:
+        st.error(f"加载历史记录失败: {e}")
+        st.code(traceback.format_exc())
+
 
 # ═══════════════════════════════════════════════════════════════
 st.divider()

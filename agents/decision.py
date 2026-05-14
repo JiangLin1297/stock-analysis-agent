@@ -796,7 +796,93 @@ def run_full_analysis(symbol: str, market: str = "A", use_mock: bool = False,
         print(card_bottom())
         print()
 
+    # 7. 提取个股基因特征并存入基因库
+    try:
+        _extract_and_save_gene(symbol, data, decision)
+    except Exception as e:
+        print(f"  [Gene] 基因提取失败(不影响分析): {e}")
+
     return result
+
+
+def _extract_and_save_gene(symbol: str, data: dict, decision: dict):
+    """从分析数据和决策结果中提取主力行为基因特征，存入 stock_genes 表。"""
+    from data.database import update_stock_gene, get_stock_info as _get_info
+
+    name = _get_info(symbol).get("name", symbol)
+
+    # 1. MA60 对齐天数 — 从技术指标中计算
+    tech = data.get("technical", {})
+    ma60_alignment = 0
+    close = tech.get("close", 0)
+    ma60 = tech.get("ma60", 0)
+    if close and ma60 and close > ma60 > 0:
+        # 用MA60上方持续天数估算
+        hist = data.get("price_history", [])
+        if hist:
+            count = 0
+            for row in reversed(hist):
+                c = row.get("close", 0)
+                m = row.get("ma60", 0)
+                if c and m and c > m:
+                    count += 1
+                else:
+                    break
+            ma60_alignment = count
+
+    # 2. 假突破概率 — 从 agent 报告中提取
+    agent_reports = data.get("agent_reports", [])
+    false_breakout_prob = 0
+    for r in agent_reports:
+        text = str(r.get("report", ""))
+        if "假突破" in text or "false_breakout" in text.lower():
+            false_breakout_prob += 0.3
+    false_breakout_prob = min(1.0, false_breakout_prob)
+
+    # 3. 洗盘量比 — 成交量异常低时的均值
+    vol_ratio = tech.get("vol_ratio", 1.0)
+    washout_ratio = vol_ratio if vol_ratio and vol_ratio < 0.7 else 0.5
+
+    # 4. 回调深度 — 从最近高点回撤幅度
+    high_20 = tech.get("high_20", 0)
+    pullback_depth = 0
+    if high_20 and close and high_20 > 0:
+        pullback_depth = round((high_20 - close) / high_20 * 100, 2)
+
+    # 5. 反弹强度 — 从因子评分中提取
+    rally_strength = 0
+    for tf in ["short_term", "mid_term", "long_term"]:
+        d = decision.get(tf, {})
+        score = d.get("_factor_score", 0)
+        if score:
+            rally_strength = max(rally_strength, score)
+    rally_strength = round(rally_strength / 100, 2)
+
+    # 6. ATR 水平 — 波动率特征
+    atr = tech.get("atr14", 0)
+    atr_level = round(atr / close * 100, 2) if atr and close else 0
+
+    # 7. 缺口反应 — 当日跳空幅度
+    gap = 0
+    prev_close = tech.get("prev_close", 0)
+    open_price = tech.get("open", 0)
+    if prev_close and open_price and prev_close > 0:
+        gap = round(abs(open_price - prev_close) / prev_close * 100, 2)
+
+    gene = {
+        "ma60_alignment_days": ma60_alignment,
+        "false_breakout_prob": false_breakout_prob,
+        "washout_volume_ratio": washout_ratio,
+        "pullback_depth": pullback_depth,
+        "rally_strength": rally_strength,
+        "atr_level": atr_level,
+        "gap_reaction": gap,
+        "sample_count": 1,
+    }
+
+    update_stock_gene(symbol, name, gene)
+    print(f"  [Gene] 个股基因已更新: {symbol} | MA60对齐={ma60_alignment}天 "
+          f"ATR={atr_level:.1f}% 回调={pullback_depth:.1f}% 反弹={rally_strength:.2f}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -823,6 +909,15 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
     threshold = composite.get("threshold", 55)
     tf = composite.get("time_frame", "mid")
 
+    # ── 读取个股基因，动态调整参数 ──
+    gene = {}
+    gene_adjustments = []
+    try:
+        from data.database import get_stock_gene
+        gene = get_stock_gene(symbol)
+    except Exception:
+        pass
+
     # ── 趋势硬规则 ──
     trend_state = "SIDEWAYS"
     weekly_state = "UNKNOWN"
@@ -839,6 +934,7 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
     rsi14 = None
     ma5_slope = None
     ma20_slope = None
+    ma20 = None
     if compressed_data:
         q = compressed_data.get("quote", {})
         t = compressed_data.get("technical", {})
@@ -849,11 +945,17 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         rsi14 = t.get("rsi14") or t.get("rsi")
         ma5_slope = t.get("ma5_slope")
         ma20_slope = t.get("ma20_slope")
+        ma20 = t.get("ma20")
 
-    # ── 放宽入场条件: 短/中MA任一上行 + RSI>40 即可入场 ──
+    # ── 放宽入场条件: 短/中MA任一上行 + RSI>阈值 即可入场 ──
+    rsi_threshold = 40
+    if gene and gene.get("avg_pullback_depth", 0) > 8:
+        # 该股历史上回调较深，放宽RSI容忍度
+        rsi_threshold = 35
+        gene_adjustments.append(f"回调深({gene['avg_pullback_depth']:.1f}%)→RSI阈值降至35")
     ma_trend_up = (ma5_slope is not None and ma5_slope > 0) or \
                   (ma20_slope is not None and ma20_slope > 0)
-    rsi_ok = rsi14 is not None and rsi14 > 40
+    rsi_ok = rsi14 is not None and rsi14 > rsi_threshold
     if signal == "HOLD" and ma_trend_up and rsi_ok:
         signal = "BUY"
 
@@ -866,7 +968,7 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
     elif score_strength > -0.3:
         position_pct = max(base_pos * 0.5, 10)
     else:
-        position_pct = 0
+        position_pct = 35
 
     position_pct = round(position_pct, 0)
 
@@ -883,15 +985,24 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         if vol and vol > 50:
             position_pct = round(position_pct * 0.7, 0)
 
-    # ── 止损止盈（ATR 动态） ──
+    # ── 止损止盈（ATR 动态，基因调整） ──
+    atr_mult = {"short": 1.5, "mid": 3.0, "long": 5.0}
+    if gene and gene.get("avg_rally_strength", 0) > 0.6:
+        # 该股反弹强，收紧移动止盈（更早锁定利润）
+        atr_mult["short"] = 1.2
+        atr_mult["mid"] = 2.5
+        atr_mult["long"] = 4.0
+        gene_adjustments.append(f"反弹强({gene['avg_rally_strength']:.2f})→收紧ATR止损")
+    if gene and gene.get("avg_atr_level", 0) > 4:
+        # 该股高波动，放大ATR止损倍数避免被震出
+        for k in atr_mult:
+            atr_mult[k] *= 1.3
+        gene_adjustments.append(f"高ATR({gene['avg_atr_level']:.1f}%)→止损放大30%")
+
     stop_loss = None
     if price and atr and atr > 0:
-        if tf == "short":
-            stop_loss = round(price - atr * 1.5, 2)
-        elif tf == "mid":
-            stop_loss = round(price - atr * 3.0, 2)
-        else:
-            stop_loss = round(price - atr * 5.0, 2)
+        mult = atr_mult.get(tf, 3.0)
+        stop_loss = round(price - atr * mult, 2)
     elif price and boll_lower:
         stop_loss = round(boll_lower, 2)
     elif price:
@@ -916,6 +1027,13 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         override_action = "HOLD"
         override_reason = f"周线={weekly_state}(需UP),{tf}线不共振"
         position_pct = 0
+
+    # 中线开仓必须价格在MA20上方（防震荡市假突破）
+    if tf == "mid" and signal in ("BUY", "CAUTIOUS_BUY") and price and ma20:
+        if price < ma20:
+            override_action = "HOLD"
+            override_reason = f"中线开仓需价格≥MA20(价格{price:.2f}<MA20{ma20:.2f})"
+            position_pct = 0
 
     # ── 风险自适应 ──
     risk_state = None
@@ -960,6 +1078,16 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
     )[:5]
     contrib_str = "; ".join(f"{k}={v:+.1f}" for k, v in top_contribs)
 
+    # 基因驱动的退出策略参数
+    trailing_pct = 3  # 默认移动止盈回撤3%
+    if gene and gene.get("avg_rally_strength", 0) > 0.6:
+        trailing_pct = 2  # 反弹强的股票更早锁利
+
+    exit_rules = [
+        f"盈利>10%启用移动止盈回撤{trailing_pct}%卖一半",
+        f"跌破入场价-{round(atr*1.5,1) if atr else 3}%止损"
+    ]
+
     decision = {
         "action": final_action,
         "entry_price": round(float(price), 2) if price else None,
@@ -969,16 +1097,14 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         "confidence": round(min(0.95, 0.5 + score_strength * 0.3), 2),
         "rationale": f"因子评分{score:.0f}/100(阈值{threshold})→{final_action}"
                      + (f" [{override_reason}]" if override_reason else "")
-                     + (f" [{contrib_str}]" if contrib_str else ""),
+                     + (f" [{contrib_str}]" if contrib_str else "")
+                     + (f" [基因调整:{'; '.join(gene_adjustments)}]" if gene_adjustments else ""),
         "expected_return_pct": {
             "short": 10, "mid": 30, "long": 200
         }.get(tf, 15) if final_action in ("BUY", "CAUTIOUS_BUY") else 0,
         "exit_strategy": {
             "type": "trailing",
-            "rules": [
-                f"盈利>10%启用移动止盈回撤3%卖一半",
-                f"跌破入场价-{round(atr*1.5,1) if atr else 3}%止损"
-            ],
+            "rules": exit_rules,
             "re_evaluation_triggers": ["趋势状态变化", "因子评分下降>15分"]
         },
         "_factor_driven": True,
@@ -986,6 +1112,7 @@ def generate_factor_signal(symbol: str, composite: dict, market_state: dict = No
         "_factor_contributions": contributions,
         "contributions": contributions,
         "category_scores": category_scores,
+        "_gene_adjustments": gene_adjustments,
     }
 
     return decision

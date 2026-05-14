@@ -111,17 +111,17 @@ def evaluate_holding(symbol: str, entry_price: float, current_price: float,
     # 短线规则
     # ═══════════════════════════════════════════════════════════
     if timeframe == "short_term":
-        # 加仓：盈利3%后加第一次
-        if profit_pct >= 3 and profit_pct < 5 and add_ratio == 0:
+        # 加仓：盈利8%且RSI>50后加第一次（防止假突破中放大亏损）
+        if profit_pct >= 8 and profit_pct < 12 and add_ratio == 0 and rsi and rsi > 50:
             add_ratio = 50
             action = "ADD"
-            reasons.append(f"短线盈利{profit_pct:.1f}%≥3%→可加第一次仓(≤原仓位50%)")
-            triggered_rules.append("short_add_3pct")
-        elif profit_pct >= 5:
+            reasons.append(f"短线盈利{profit_pct:.1f}%≥8%且RSI={rsi:.0f}>50→可加第一次仓(≤原仓位50%)")
+            triggered_rules.append("short_add_8pct_rsi")
+        elif profit_pct >= 12 and rsi and rsi > 50:
             add_ratio = 50
             action = "ADD"
-            reasons.append(f"短线盈利{profit_pct:.1f}%≥5%→可加第二次仓(≤原仓位50%)")
-            triggered_rules.append("short_add_5pct")
+            reasons.append(f"短线盈利{profit_pct:.1f}%≥12%且RSI={rsi:.0f}>50→可加第二次仓(≤原仓位50%)")
+            triggered_rules.append("short_add_12pct_rsi")
 
         # 浮亏不允许加仓
         if profit_pct < 0 and action == "ADD":

@@ -395,6 +395,7 @@ def _score_ath_distance(df: pd.DataFrame) -> float:
 def _score_market_cap_range(mc: float) -> float:
     """
     市值适中: 100~500亿最优（既有流动性又有成长空间）。
+    流通市值 < 50亿的股票额外加分（盘口轻，容易拉升）。
     返回 0~1。
     """
     if mc is None or mc <= 0:
@@ -409,7 +410,9 @@ def _score_market_cap_range(mc: float) -> float:
     elif 500 < mc_yi <= 1000:
         return 0.6
     elif 30 <= mc_yi < 50:
-        return 0.5
+        return 0.75  # 小市值加分（原0.5 → 0.75）
+    elif mc_yi < 30:
+        return 0.7   # 微盘股加分（原0.0 → 0.7，盘口轻容易拉升）
     elif mc_yi > 1000:
         return 0.2
     return 0.0

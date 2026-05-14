@@ -99,10 +99,11 @@ def run_backtest_with_critic(symbol: str = "600744", time_frame: str = "mid",
         print(f"{'#'*70}\n")
 
         # 强制重载模块（可能被上一轮修改过）
+        # 注意: analysis.factor_weights 不是 Python 模块（是 JSON），不需要 reload
         import importlib
-        for mod_name in ['backtest.engine', 'agents.critic', 'agents.decision',
-                          'agents.prompts', 'analysis.alpha', 'analysis.holding',
-                          'analysis.factor_weights', 'evolution.improver']:
+        for mod_name in ['analysis.alpha', 'agents.decision', 'analysis.holding',
+                          'backtest.engine', 'agents.critic', 'agents.prompts',
+                          'evolution.improver']:
             if mod_name in sys.modules:
                 try:
                     importlib.reload(sys.modules[mod_name])
@@ -232,6 +233,21 @@ def run_backtest_with_critic(symbol: str = "600744", time_frame: str = "mid",
             log("本轮无有效修改，进化结束")
             print("\n  ⚠ 本轮无有效修改，进化结束")
             break
+
+        # 读回 factor_weights.json 验证修改已落盘
+        _fw_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '..', 'analysis', 'factor_weights.json')
+        try:
+            with open(_fw_path, 'r', encoding='utf-8') as _f:
+                _fw = json.load(_f)
+            _fw_s = _fw.get('short', {}).get('threshold', '?')
+            _fw_m = _fw.get('mid', {}).get('threshold', '?')
+            _fw_l = _fw.get('long', {}).get('threshold', '?')
+            print(f"  [读回验证] factor_weights.json 当前阈值: "
+                  f"短线={_fw_s} 中线={_fw_m} 长线={_fw_l}")
+            log(f"  [读回验证] 阈值: 短线={_fw_s} 中线={_fw_m} 长线={_fw_l}")
+        except Exception as _e:
+            print(f"  [读回验证] factor_weights.json 读取失败: {_e}")
 
         # 等待文件系统同步
         time.sleep(0.5)

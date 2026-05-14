@@ -164,6 +164,17 @@ def _set_json_value(data: dict, dot_path: str, new_value) -> bool:
     return True
 
 
+def _get_json_value(data: dict, dot_path: str):
+    """按点分隔路径读取 JSON 值。例如 "short.threshold" → data["short"]["threshold"]。"""
+    keys = dot_path.split(".")
+    obj = data
+    for k in keys:
+        if not isinstance(obj, dict) or k not in obj:
+            return None
+        obj = obj[k]
+    return obj
+
+
 def apply_fix(critic_json: dict) -> int:
     """解析 Critic 输出的 JSON 中的 operations 数组，逐条执行文件修改。
 
@@ -208,6 +219,7 @@ def apply_fix(critic_json: dict) -> int:
                 log(f"  ⚠ [operation] 读取 JSON 失败: {file_rel} — {e}")
                 continue
 
+            old_value = _get_json_value(data, target)
             if not _set_json_value(data, target, new_value):
                 log(f"  ⚠ [operation] 路径不存在: {file_rel}:{target}")
                 continue
@@ -219,6 +231,20 @@ def apply_fix(critic_json: dict) -> int:
             except Exception as e:
                 log(f"  ⚠ [operation] 写入 JSON 失败: {file_rel} — {e}")
                 continue
+
+            # 读回验证：确认修改已落盘
+            try:
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    verify_data = json.load(f)
+                readback_value = _get_json_value(verify_data, target)
+                if str(readback_value) == str(new_value):
+                    print(f"  [落盘验证] {file_rel}:{target} "
+                          f"修改前={old_value} → 修改后={readback_value} ✓")
+                else:
+                    print(f"  [落盘验证] {file_rel}:{target} "
+                          f"期望={new_value} 实际读回={readback_value} ✗ 不一致!")
+            except Exception as e:
+                print(f"  [落盘验证] 读回失败: {e}")
 
             FILE_MOD_COUNT[target_file] += 1
             log(f"  [Critic生效] {file_rel}:{target} = {new_value}")
@@ -239,6 +265,7 @@ def apply_fix(critic_json: dict) -> int:
                 log(f"  ⚠ [operation] 未找到赋值语句: {file_rel}:{target}")
                 continue
 
+            old_line = match.group(0)
             replacement = f"{target} = {new_value}"
             new_content = content[:match.start()] + replacement + content[match.end():]
 
@@ -249,6 +276,20 @@ def apply_fix(critic_json: dict) -> int:
             except Exception as e:
                 log(f"  ⚠ [operation] 写入 Python 失败: {file_rel} — {e}")
                 continue
+
+            # 读回验证
+            try:
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    verify_content = f.read()
+                verify_pattern = r'\b' + re.escape(target) + r'\s*=\s*[0-9.]+'
+                verify_match = re.search(verify_pattern, verify_content)
+                if verify_match:
+                    print(f"  [落盘验证] {file_rel}:{target} "
+                          f"修改前='{old_line}' → 修改后='{verify_match.group(0)}' ✓")
+                else:
+                    print(f"  [落盘验证] {file_rel}:{target} 读回未找到赋值语句 ✗")
+            except Exception as e:
+                print(f"  [落盘验证] 读回失败: {e}")
 
             FILE_MOD_COUNT[target_file] += 1
             log(f"  [Critic生效] {file_rel}:{target} = {new_value}")

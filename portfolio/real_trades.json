@@ -1,0 +1,40 @@
+[
+  {
+    "id": 1,
+    "timestamp": "2026-05-14T19:46:50.969222",
+    "symbol": "300210",
+    "action": "BUY",
+    "price": 10.0,
+    "quantity": 100,
+    "reason": "用户手动录入持仓",
+    "pnl": 0.0,
+    "time_frame": "mid",
+    "name": "300210",
+    "date": "2026-05-14"
+  },
+  {
+    "id": 2,
+    "timestamp": "2026-05-14T21:18:27.867874",
+    "symbol": "300210",
+    "action": "SELL",
+    "price": 10.0,
+    "quantity": 100,
+    "reason": "用户手动卖出持仓",
+    "pnl": 0.0,
+    "time_frame": "mid",
+    "date": "2026-05-14"
+  },
+  {
+    "id": 3,
+    "timestamp": "2026-05-14T21:18:47.019415",
+    "symbol": "300210",
+    "action": "BUY",
+    "price": 10.0,
+    "quantity": 100,
+    "reason": "用户手动录入持仓",
+    "pnl": 0.0,
+    "time_frame": "mid",
+    "name": "森远股份",
+    "date": "2026-05-14"
+  }
+]
